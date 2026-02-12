@@ -1,0 +1,22 @@
+# Streamlit
+streamlit>=1.28.0
+
+# Google Cloud & Authentication
+google-auth>=2.23.0
+google-auth-oauthlib>=1.0.0
+google-cloud-bigquery>=3.11.0
+google-cloud-secret-manager>=2.16.0
+
+# Data Processing
+pandas>=2.1.0
+numpy>=1.24.0
+db-dtypes>=1.2.0
+pyarrow>=14.0.0
+
+# Visualization
+plotly>=5.17.0
+
+# Utilities
+requests>=2.31.0
+pyyaml>=6.0.1
+python-dateutil>=2.8.2
