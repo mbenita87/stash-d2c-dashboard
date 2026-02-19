@@ -10,18 +10,22 @@ def get_bigquery_client() -> bigquery.Client:
     """Get or create BigQuery client instance.
 
     Uses Streamlit secrets for credentials when available (Streamlit Cloud),
-    otherwise falls back to Application Default Credentials (local development).
+    otherwise falls back to Application Default Credentials (Cloud Run / local development).
     """
     project_id = "yotam-395120"
 
     # Check if running on Streamlit Cloud with secrets
-    if hasattr(st, 'secrets') and 'gcp_service_account' in st.secrets:
-        credentials = service_account.Credentials.from_service_account_info(
-            st.secrets["gcp_service_account"]
-        )
-        return bigquery.Client(project=project_id, credentials=credentials)
+    try:
+        if hasattr(st, 'secrets') and 'gcp_service_account' in st.secrets:
+            credentials = service_account.Credentials.from_service_account_info(
+                st.secrets["gcp_service_account"]
+            )
+            return bigquery.Client(project=project_id, credentials=credentials)
+    except Exception:
+        # Secrets not configured, fall through to ADC
+        pass
 
-    # Fallback to Application Default Credentials (local development)
+    # Fallback to Application Default Credentials (Cloud Run / local development)
     return bigquery.Client(project=project_id)
 
 
