@@ -3,22 +3,23 @@
 from typing import Dict, Any
 import pandas as pd
 import plotly.graph_objects as go
-from utils.bigquery_client import run_query, build_date_filter, build_date_filter_seconds, build_filter_conditions, build_test_users_join
+from utils.bigquery_client import run_query, build_date_filter, build_date_filter_seconds, build_filter_conditions, get_firebase_segment_cte, build_firebase_test_users_join
 
 
 def build_query(filters: Dict[str, Any]) -> str:
     """
     Build SQL query for total funnel executions.
-    
+    Uses Firebase segments (stash_test) for user filtering.
+
     Returns count of distinct purchase_funnel_id for client events and request_id for server events.
     """
     # Build filter conditions
     date_filter_client = build_date_filter(filters["start_date"], filters["end_date"], "res_timestamp")
     date_filter_server = build_date_filter_seconds(filters["start_date"], filters["end_date"], "request_timestamp")
-    
+
     # Add date partition filter (required by BigQuery)
     date_partition_filter = f"date >= '{filters['start_date']}' AND date <= '{filters['end_date']}'"
-    
+
     # Build filter conditions WITHOUT table alias for use inside CTE
     filter_conditions = []
     if filters.get("mp_os"):
@@ -35,23 +36,13 @@ def build_query(filters: Dict[str, Any]) -> str:
         filter_conditions.append(f"mp_country_code IN ({country_values})")
     if filters.get("is_low_payers_country"):
         filter_conditions.append(f"mp_country_code IN (SELECT country_code FROM `yotam-395120.peerplay.dim_country` WHERE is_low_payers_country = true)")
-    
+
     # Hard-coded version filter: only events with version >= 0.3775
     filter_conditions.append("version_float >= 0.3775")
-    
-    test_users_join, _ = build_test_users_join(filters.get("is_stash_test_users", False))
-    
+
     where_clauses = [date_partition_filter, date_filter_client] + filter_conditions
     where_clause = " AND ".join([c.strip() for c in where_clauses if c.strip()])
-    
-    # Build server events with test users filter if enabled
-    server_test_users_clause = ""
-    if filters.get("is_stash_test_users", False):
-        server_test_users_clause = """
-        INNER JOIN `yotam-395120.peerplay.stash_test_users_no_google_sheet` test_users
-        ON se.distinct_id = test_users.distinct_id
-        """
-    
+
     # Build server event filters (version and country from client metadata)
     server_filter_conditions = []
     if filters.get("version"):
@@ -61,26 +52,32 @@ def build_query(filters: Dict[str, Any]) -> str:
         else:
             server_filter_conditions.append(f"client_version_float = {filters['version']}")
     server_filter_conditions.append("client_version_float >= 0.3775")
-    
+
     if filters.get("country"):
         country_values = ", ".join([f"'{c}'" for c in filters["country"]])
         server_filter_conditions.append(f"client_country_code IN ({country_values})")
-    
+
     if filters.get("is_low_payers_country"):
         server_filter_conditions.append(f"client_country_code IN (SELECT country_code FROM `yotam-395120.peerplay.dim_country` WHERE is_low_payers_country = true)")
-    
+
     server_where_clause = " AND ".join(server_filter_conditions) if server_filter_conditions else "1=1"
-    
+
+    # Use Firebase segments for test users filtering
+    firebase_cte = get_firebase_segment_cte()
+    firebase_join = build_firebase_test_users_join("ce")
+    firebase_join_server = build_firebase_test_users_join("se")
+
     query = f"""
-    WITH client_events AS (
-      SELECT 
+    WITH {firebase_cte}
+    client_events AS (
+      SELECT
         ce.distinct_id,
         ce.mp_event_name,
         ce.purchase_funnel_id,
         ce.cta_name,
         ce.payment_platform
       FROM `yotam-395120.peerplay.vmp_master_event_normalized` ce
-      {test_users_join.replace('client_events', 'ce') if test_users_join else ''}
+      {firebase_join}
       WHERE {where_clause}
         AND purchase_funnel_id IS NOT NULL
     ),
@@ -115,7 +112,7 @@ def build_query(filters: Dict[str, Any]) -> str:
           ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING
         ) as client_country_code
       FROM `yotam-395120.peerplay.verification_service_events` se
-      {server_test_users_clause}
+      {firebase_join_server}
       LEFT JOIN client_events_metadata cm
         ON se.distinct_id = cm.distinct_id
         AND cm.res_timestamp_seconds <= se.request_timestamp

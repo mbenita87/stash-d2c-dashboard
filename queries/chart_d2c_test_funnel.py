@@ -6,12 +6,78 @@ import plotly.graph_objects as go
 from utils.bigquery_client import run_query
 
 
+def get_effective_start_date(filters: Dict[str, Any]) -> str:
+    """
+    Get the effective start date considering the test start date.
+    Returns the later of start_date and test_start_date.
+    If test hasn't started yet (test_start_date > end_date), returns start_date.
+    """
+    start_date = filters.get('start_date')
+    end_date = filters.get('end_date')
+    test_start_date = filters.get('test_start_date')
+
+    # If no test_start_date, use start_date
+    if not test_start_date:
+        return start_date
+
+    # If test_start_date is after end_date, test hasn't started yet - use original start_date
+    if str(test_start_date) > str(end_date):
+        return start_date
+
+    # Compare as strings (YYYY-MM-DD format allows string comparison)
+    if str(start_date) < str(test_start_date):
+        return test_start_date
+    return start_date
+
+
+# Firebase segment CTE - reusable across all queries
+FIREBASE_SEGMENT_CTE = """
+    firebase_segment_events AS (
+        SELECT
+            distinct_id,
+            CASE
+                WHEN firebase_segments LIKE '%LiveOpsData.stash_test%' THEN 'test'
+                WHEN firebase_segments LIKE '%LiveOpsData.stash_control%' THEN 'control'
+            END as segment,
+            ROW_NUMBER() OVER (PARTITION BY distinct_id ORDER BY date DESC, time DESC) as rn
+        FROM `yotam-395120.peerplay.vmp_master_event_normalized`
+        WHERE mp_event_name = 'dynamic_configuration_loaded'
+          AND date >= DATE_SUB(CURRENT_DATE(), INTERVAL 30 DAY)
+          AND (firebase_segments LIKE '%LiveOpsData.stash_test%'
+               OR firebase_segments LIKE '%LiveOpsData.stash_control%')
+    ),
+    d2c_test_users AS (
+        -- Only Test group users (Firebase segment: stash_test)
+        SELECT p.distinct_id
+        FROM `yotam-395120.peerplay.dim_player` p
+        INNER JOIN (
+            SELECT distinct_id
+            FROM firebase_segment_events
+            WHERE rn = 1 AND segment = 'test'
+        ) fs ON p.distinct_id = fs.distinct_id
+        WHERE p.first_country = 'US'
+    ),
+    d2c_control_users AS (
+        -- Only Control group users (Firebase segment: stash_control)
+        SELECT p.distinct_id
+        FROM `yotam-395120.peerplay.dim_player` p
+        INNER JOIN (
+            SELECT distinct_id
+            FROM firebase_segment_events
+            WHERE rn = 1 AND segment = 'control'
+        ) fs ON p.distinct_id = fs.distinct_id
+        WHERE p.first_country = 'US'
+    ),
+"""
+
+
 def build_funnel_query(filters: Dict[str, Any]) -> str:
     """
     Build SQL query for D2C Test group funnel metrics.
-    Only includes Test group users (20% based on hash).
+    Only includes Test group users (Firebase segment: stash_test).
+    Data is filtered to only include events after test start date.
     """
-    start_date = filters.get('start_date')
+    start_date = get_effective_start_date(filters)
     end_date = filters.get('end_date')
 
     # Build OS filter
@@ -27,23 +93,7 @@ def build_funnel_query(filters: Dict[str, Any]) -> str:
         version_filter = f"AND ce.version_float IN ({version_values})"
 
     query = f"""
-    WITH d2c_test_users AS (
-        -- Only Test group users (hash_bucket < 20)
-        SELECT
-            p.distinct_id
-        FROM `yotam-395120.peerplay.dim_player` p
-        JOIN (
-            SELECT distinct_id, MAX(version_float) as latest_version
-            FROM `yotam-395120.peerplay.vmp_master_event_normalized`
-            WHERE date >= DATE_SUB(CURRENT_DATE(), INTERVAL 30 DAY)
-              AND version_float IS NOT NULL AND version_float > 0
-            GROUP BY distinct_id
-        ) v ON p.distinct_id = v.distinct_id
-        WHERE p.first_country = 'US'
-          AND v.latest_version > 0.378
-          AND DATE_DIFF(CURRENT_DATE(), DATE(p.first_event_time), DAY) > 3
-          AND MOD(ABS(FARM_FINGERPRINT(p.distinct_id)), 100) < 20
-    ),
+    WITH {FIREBASE_SEGMENT_CTE}
     funnel_events AS (
         SELECT
             ce.distinct_id,
@@ -61,6 +111,14 @@ def build_funnel_query(filters: Dict[str, Any]) -> str:
           {os_filter}
           {version_filter}
           AND ce.mp_event_name IN ('purchase_click', 'click_pre_purchase', 'purchase_successful')
+    ),
+    -- Get funnels that had IAP continue (to filter IAP purchases)
+    iap_continue_funnels AS (
+        SELECT DISTINCT purchase_funnel_id
+        FROM funnel_events
+        WHERE mp_event_name = 'click_pre_purchase'
+          AND cta_name = 'continue'
+          AND payment_platform IN ('apple', 'googleplay')
     ),
     funnel_metrics AS (
         SELECT
@@ -92,20 +150,24 @@ def build_funnel_query(filters: Dict[str, Any]) -> str:
             END) as google_continue,
 
             -- Purchase Success (by platform)
+            -- Stash: count all successful purchases
             COUNT(DISTINCT CASE
                 WHEN mp_event_name = 'purchase_successful' AND payment_platform = 'stash'
                 THEN purchase_funnel_id
             END) as stash_purchases,
 
+            -- IAP: only count purchases that went through the pre-purchase flow (had IAP continue)
             COUNT(DISTINCT CASE
                 WHEN mp_event_name = 'purchase_successful' AND payment_platform = 'apple'
                   AND purchase_id IS NOT NULL AND purchase_id != ''
+                  AND purchase_funnel_id IN (SELECT purchase_funnel_id FROM iap_continue_funnels)
                 THEN purchase_funnel_id
             END) as apple_purchases,
 
             COUNT(DISTINCT CASE
                 WHEN mp_event_name = 'purchase_successful' AND payment_platform = 'googleplay'
                   AND google_order_number IS NOT NULL AND google_order_number != ''
+                  AND purchase_funnel_id IN (SELECT purchase_funnel_id FROM iap_continue_funnels)
                 THEN purchase_funnel_id
             END) as google_purchases,
 
@@ -115,15 +177,18 @@ def build_funnel_query(filters: Dict[str, Any]) -> str:
                 THEN COALESCE(price_usd, 0) ELSE 0
             END) as stash_revenue,
 
+            -- IAP Revenue: only count from purchases that went through the pre-purchase flow
             SUM(CASE
                 WHEN mp_event_name = 'purchase_successful' AND payment_platform = 'apple'
                   AND purchase_id IS NOT NULL AND purchase_id != ''
+                  AND purchase_funnel_id IN (SELECT purchase_funnel_id FROM iap_continue_funnels)
                 THEN COALESCE(price_usd, 0) ELSE 0
             END) as apple_revenue,
 
             SUM(CASE
                 WHEN mp_event_name = 'purchase_successful' AND payment_platform = 'googleplay'
                   AND google_order_number IS NOT NULL AND google_order_number != ''
+                  AND purchase_funnel_id IN (SELECT purchase_funnel_id FROM iap_continue_funnels)
                 THEN COALESCE(price_usd, 0) ELSE 0
             END) as google_revenue,
 
@@ -133,15 +198,18 @@ def build_funnel_query(filters: Dict[str, Any]) -> str:
                 THEN distinct_id
             END) as stash_paying_users,
 
+            -- IAP Paying users: only count from purchases that went through the pre-purchase flow
             COUNT(DISTINCT CASE
                 WHEN mp_event_name = 'purchase_successful' AND payment_platform = 'apple'
                   AND purchase_id IS NOT NULL AND purchase_id != ''
+                  AND purchase_funnel_id IN (SELECT purchase_funnel_id FROM iap_continue_funnels)
                 THEN distinct_id
             END) as apple_paying_users,
 
             COUNT(DISTINCT CASE
                 WHEN mp_event_name = 'purchase_successful' AND payment_platform = 'googleplay'
                   AND google_order_number IS NOT NULL AND google_order_number != ''
+                  AND purchase_funnel_id IN (SELECT purchase_funnel_id FROM iap_continue_funnels)
                 THEN distinct_id
             END) as google_paying_users
         FROM funnel_events
@@ -152,8 +220,9 @@ def build_funnel_query(filters: Dict[str, Any]) -> str:
 
 
 def build_daily_funnel_query(filters: Dict[str, Any]) -> str:
-    """Build query for daily funnel metrics for timeline chart."""
-    start_date = filters.get('start_date')
+    """Build query for daily funnel metrics for timeline chart.
+    Data is filtered to only include events after test start date."""
+    start_date = get_effective_start_date(filters)
     end_date = filters.get('end_date')
 
     # Build OS filter
@@ -169,21 +238,8 @@ def build_daily_funnel_query(filters: Dict[str, Any]) -> str:
         version_filter = f"AND ce.version_float IN ({version_values})"
 
     query = f"""
-    WITH d2c_test_users AS (
-        SELECT p.distinct_id
-        FROM `yotam-395120.peerplay.dim_player` p
-        JOIN (
-            SELECT distinct_id, MAX(version_float) as latest_version
-            FROM `yotam-395120.peerplay.vmp_master_event_normalized`
-            WHERE date >= DATE_SUB(CURRENT_DATE(), INTERVAL 30 DAY)
-              AND version_float IS NOT NULL AND version_float > 0
-            GROUP BY distinct_id
-        ) v ON p.distinct_id = v.distinct_id
-        WHERE p.first_country = 'US'
-          AND v.latest_version > 0.378
-          AND DATE_DIFF(CURRENT_DATE(), DATE(p.first_event_time), DAY) > 3
-          AND MOD(ABS(FARM_FINGERPRINT(p.distinct_id)), 100) < 20
-    )
+    WITH {FIREBASE_SEGMENT_CTE}
+    dummy AS (SELECT 1)
     SELECT
         ce.date as event_date,
 
@@ -259,28 +315,44 @@ def create_funnel_charts(df: pd.DataFrame) -> tuple:
 
     row = df.iloc[0]
 
-    purchase_clicks = row['purchase_clicks']
-    stash_continue = row['stash_continue']
-    apple_continue = row['apple_continue']
-    google_continue = row['google_continue']
-    stash_purchases = row['stash_purchases']
-    apple_purchases = row['apple_purchases']
-    google_purchases = row['google_purchases']
+    # Convert to native Python int to avoid Plotly issues with numpy types
+    purchase_clicks = int(row['purchase_clicks']) if pd.notna(row['purchase_clicks']) else 0
+    stash_continue = int(row['stash_continue']) if pd.notna(row['stash_continue']) else 0
+    apple_continue = int(row['apple_continue']) if pd.notna(row['apple_continue']) else 0
+    google_continue = int(row['google_continue']) if pd.notna(row['google_continue']) else 0
+    stash_purchases = int(row['stash_purchases']) if pd.notna(row['stash_purchases']) else 0
+    apple_purchases = int(row['apple_purchases']) if pd.notna(row['apple_purchases']) else 0
+    google_purchases = int(row['google_purchases']) if pd.notna(row['google_purchases']) else 0
 
     iap_continue = apple_continue + google_continue
     iap_purchases = apple_purchases + google_purchases
 
     # Stash (D2C) Funnel - Green colors
+    # Filter out zero values to avoid Plotly Funnel errors
     fig_stash = go.Figure()
-    fig_stash.add_trace(go.Funnel(
-        name='Stash (D2C)',
-        y=['Purchase Click', 'Continue to Stash', 'Purchase Success'],
-        x=[purchase_clicks, stash_continue, stash_purchases],
-        textposition="inside",
-        textinfo="value+percent initial",
-        marker=dict(color=['#27ae60', '#2ecc71', '#58d68d']),
-        connector=dict(line=dict(color="#27ae60", width=2))
-    ))
+    stash_labels = []
+    stash_values = []
+    stash_colors = []
+    all_stash_labels = ['Purchase Click', 'Continue to Stash', 'Purchase Success']
+    all_stash_values = [purchase_clicks, stash_continue, stash_purchases]
+    all_stash_colors = ['#27ae60', '#2ecc71', '#58d68d']
+
+    for label, value, color in zip(all_stash_labels, all_stash_values, all_stash_colors):
+        if value > 0:
+            stash_labels.append(label)
+            stash_values.append(value)
+            stash_colors.append(color)
+
+    if stash_values:
+        fig_stash.add_trace(go.Funnel(
+            name='Stash (D2C)',
+            y=stash_labels,
+            x=stash_values,
+            textposition="inside",
+            textinfo="value+percent initial",
+            marker=dict(color=stash_colors),
+            connector=dict(line=dict(color="#27ae60", width=2))
+        ))
     fig_stash.update_layout(
         title="💚 Stash (D2C) Funnel",
         height=400,
@@ -288,16 +360,31 @@ def create_funnel_charts(df: pd.DataFrame) -> tuple:
     )
 
     # IAP (Apple/Google) Funnel - Red/Orange colors
+    # Filter out zero values to avoid Plotly Funnel errors
     fig_iap = go.Figure()
-    fig_iap.add_trace(go.Funnel(
-        name='IAP (Apple/Google)',
-        y=['Purchase Click', 'Continue to IAP', 'Purchase Success'],
-        x=[purchase_clicks, iap_continue, iap_purchases],
-        textposition="inside",
-        textinfo="value+percent initial",
-        marker=dict(color=['#e74c3c', '#c0392b', '#a93226']),
-        connector=dict(line=dict(color="#e74c3c", width=2))
-    ))
+    iap_labels = []
+    iap_values = []
+    iap_colors = []
+    all_iap_labels = ['Purchase Click', 'Continue to IAP', 'Purchase Success']
+    all_iap_values = [purchase_clicks, iap_continue, iap_purchases]
+    all_iap_colors = ['#e74c3c', '#c0392b', '#a93226']
+
+    for label, value, color in zip(all_iap_labels, all_iap_values, all_iap_colors):
+        if value > 0:
+            iap_labels.append(label)
+            iap_values.append(value)
+            iap_colors.append(color)
+
+    if iap_values:
+        fig_iap.add_trace(go.Funnel(
+            name='IAP (Apple/Google)',
+            y=iap_labels,
+            x=iap_values,
+            textposition="inside",
+            textinfo="value+percent initial",
+            marker=dict(color=iap_colors),
+            connector=dict(line=dict(color="#e74c3c", width=2))
+        ))
     fig_iap.update_layout(
         title="🔴 IAP (Apple/Google) Funnel",
         height=400,
@@ -317,8 +404,11 @@ def create_prepurchase_choice_pie(df: pd.DataFrame) -> go.Figure:
 
     row = df.iloc[0]
 
-    stash_continue = row['stash_continue']
-    iap_continue = row['apple_continue'] + row['google_continue']
+    # Convert to native Python int to avoid Plotly issues with numpy types
+    stash_continue = int(row['stash_continue']) if pd.notna(row['stash_continue']) else 0
+    apple_continue = int(row['apple_continue']) if pd.notna(row['apple_continue']) else 0
+    google_continue = int(row['google_continue']) if pd.notna(row['google_continue']) else 0
+    iap_continue = apple_continue + google_continue
 
     total_continue = stash_continue + iap_continue
 
@@ -350,53 +440,69 @@ def create_daily_chart(df: pd.DataFrame, metric: str, title: str) -> go.Figure:
     if df.empty:
         return go.Figure()
 
+    # Convert BigQuery types to native Python types to avoid Plotly issues
+    # Convert event_date to string to ensure compatibility
+    event_dates = [str(d) if d is not None else None for d in df['event_date'].tolist()]
+
     fig = go.Figure()
 
     if metric == 'revenue':
+        stash_rev = [float(v) if pd.notna(v) and v is not None else 0.0 for v in df['stash_revenue'].tolist()]
+        iap_rev = [float(v) if pd.notna(v) and v is not None else 0.0 for v in df['iap_revenue'].tolist()]
         fig.add_trace(go.Scatter(
-            x=df['event_date'],
-            y=df['stash_revenue'],
+            x=event_dates,
+            y=stash_rev,
             name='Stash Revenue',
             mode='lines+markers',
             line=dict(color='#2ecc71', width=2)
         ))
         fig.add_trace(go.Scatter(
-            x=df['event_date'],
-            y=df['iap_revenue'],
+            x=event_dates,
+            y=iap_rev,
             name='IAP Revenue',
             mode='lines+markers',
             line=dict(color='#e74c3c', width=2)
         ))
     elif metric == 'purchases':
+        stash_purch = [int(v) if pd.notna(v) and v is not None else 0 for v in df['stash_purchases'].tolist()]
+        iap_purch = [int(v) if pd.notna(v) and v is not None else 0 for v in df['iap_purchases'].tolist()]
         fig.add_trace(go.Scatter(
-            x=df['event_date'],
-            y=df['stash_purchases'],
+            x=event_dates,
+            y=stash_purch,
             name='Stash Purchases',
             mode='lines+markers',
             line=dict(color='#2ecc71', width=2)
         ))
         fig.add_trace(go.Scatter(
-            x=df['event_date'],
-            y=df['iap_purchases'],
+            x=event_dates,
+            y=iap_purch,
             name='IAP Purchases',
             mode='lines+markers',
             line=dict(color='#e74c3c', width=2)
         ))
     elif metric == 'conversion':
-        # Calculate conversion rates
-        df['stash_conversion'] = (df['stash_purchases'] / df['stash_continue'] * 100).fillna(0)
-        df['iap_conversion'] = (df['iap_purchases'] / df['iap_continue'] * 100).fillna(0)
+        # Calculate conversion rates with safe division
+        stash_conv = []
+        iap_conv = []
+        for _, row in df.iterrows():
+            stash_continue = float(row['stash_continue']) if pd.notna(row['stash_continue']) else 0
+            stash_purchases = float(row['stash_purchases']) if pd.notna(row['stash_purchases']) else 0
+            iap_continue = float(row['iap_continue']) if pd.notna(row['iap_continue']) else 0
+            iap_purchases = float(row['iap_purchases']) if pd.notna(row['iap_purchases']) else 0
+
+            stash_conv.append((stash_purchases / stash_continue * 100) if stash_continue > 0 else 0.0)
+            iap_conv.append((iap_purchases / iap_continue * 100) if iap_continue > 0 else 0.0)
 
         fig.add_trace(go.Scatter(
-            x=df['event_date'],
-            y=df['stash_conversion'],
+            x=event_dates,
+            y=stash_conv,
             name='Stash Conversion %',
             mode='lines+markers',
             line=dict(color='#2ecc71', width=2)
         ))
         fig.add_trace(go.Scatter(
-            x=df['event_date'],
-            y=df['iap_conversion'],
+            x=event_dates,
+            y=iap_conv,
             name='IAP Conversion %',
             mode='lines+markers',
             line=dict(color='#e74c3c', width=2)
@@ -417,8 +523,9 @@ def create_daily_chart(df: pd.DataFrame, metric: str, title: str) -> go.Figure:
 def build_d2c_first_vs_repeat_query(filters: Dict[str, Any]) -> str:
     """
     Build query to track first-time vs repeat D2C (Stash) purchasers by day.
+    Data is filtered to only include events after test start date.
     """
-    start_date = filters.get('start_date')
+    start_date = get_effective_start_date(filters)
     end_date = filters.get('end_date')
 
     # Build OS filter
@@ -434,22 +541,7 @@ def build_d2c_first_vs_repeat_query(filters: Dict[str, Any]) -> str:
         version_filter = f"AND ce.version_float IN ({version_values})"
 
     query = f"""
-    WITH d2c_test_users AS (
-        -- Only Test group users (hash_bucket < 20)
-        SELECT p.distinct_id
-        FROM `yotam-395120.peerplay.dim_player` p
-        JOIN (
-            SELECT distinct_id, MAX(version_float) as latest_version
-            FROM `yotam-395120.peerplay.vmp_master_event_normalized`
-            WHERE date >= DATE_SUB(CURRENT_DATE(), INTERVAL 30 DAY)
-              AND version_float IS NOT NULL AND version_float > 0
-            GROUP BY distinct_id
-        ) v ON p.distinct_id = v.distinct_id
-        WHERE p.first_country = 'US'
-          AND v.latest_version > 0.378
-          AND DATE_DIFF(CURRENT_DATE(), DATE(p.first_event_time), DAY) > 3
-          AND MOD(ABS(FARM_FINGERPRINT(p.distinct_id)), 100) < 20
-    ),
+    WITH {FIREBASE_SEGMENT_CTE}
     stash_purchases AS (
         -- All Stash purchases with purchase ranking per user
         -- Look back 1 year to correctly identify first vs repeat purchases
@@ -498,12 +590,17 @@ def create_first_vs_repeat_chart(df: pd.DataFrame) -> go.Figure:
     if df.empty:
         return go.Figure()
 
+    # Convert to native Python types to avoid Plotly issues with numpy types
+    event_dates = df['event_date'].tolist()
+    first_purchase = [int(v) if pd.notna(v) else 0 for v in df['first_purchase_users']]
+    repeat_purchase = [int(v) if pd.notna(v) else 0 for v in df['repeat_purchase_users']]
+
     fig = go.Figure()
 
     # First purchase users - blue
     fig.add_trace(go.Scatter(
-        x=df['event_date'],
-        y=df['first_purchase_users'],
+        x=event_dates,
+        y=first_purchase,
         name='First D2C Purchase',
         mode='lines+markers',
         line=dict(color='#3498db', width=2),
@@ -512,8 +609,8 @@ def create_first_vs_repeat_chart(df: pd.DataFrame) -> go.Figure:
 
     # Repeat purchase users - orange
     fig.add_trace(go.Scatter(
-        x=df['event_date'],
-        y=df['repeat_purchase_users'],
+        x=event_dates,
+        y=repeat_purchase,
         name='Repeat D2C Purchase (2nd+)',
         mode='lines+markers',
         line=dict(color='#e67e22', width=2),
@@ -535,8 +632,9 @@ def create_first_vs_repeat_chart(df: pd.DataFrame) -> go.Figure:
 def build_d2c_adoption_funnel_query(filters: Dict[str, Any]) -> str:
     """
     Build query to show D2C adoption funnel - users by purchase number (1st, 2nd, 3rd, 4th+).
+    Data is filtered to only include events after test start date.
     """
-    start_date = filters.get('start_date')
+    start_date = get_effective_start_date(filters)
     end_date = filters.get('end_date')
 
     # Build OS filter
@@ -552,22 +650,7 @@ def build_d2c_adoption_funnel_query(filters: Dict[str, Any]) -> str:
         version_filter = f"AND ce.version_float IN ({version_values})"
 
     query = f"""
-    WITH d2c_test_users AS (
-        -- Only Test group users (hash_bucket < 20)
-        SELECT p.distinct_id
-        FROM `yotam-395120.peerplay.dim_player` p
-        JOIN (
-            SELECT distinct_id, MAX(version_float) as latest_version
-            FROM `yotam-395120.peerplay.vmp_master_event_normalized`
-            WHERE date >= DATE_SUB(CURRENT_DATE(), INTERVAL 30 DAY)
-              AND version_float IS NOT NULL AND version_float > 0
-            GROUP BY distinct_id
-        ) v ON p.distinct_id = v.distinct_id
-        WHERE p.first_country = 'US'
-          AND v.latest_version > 0.378
-          AND DATE_DIFF(CURRENT_DATE(), DATE(p.first_event_time), DAY) > 3
-          AND MOD(ABS(FARM_FINGERPRINT(p.distinct_id)), 100) < 20
-    ),
+    WITH {FIREBASE_SEGMENT_CTE}
     stash_purchases AS (
         -- All Stash purchases with purchase ranking per user
         SELECT
@@ -613,8 +696,9 @@ def build_d2c_atv_by_purchase_number_query(filters: Dict[str, Any]) -> str:
     """
     Build query to show Average Transaction Value (ATV) by purchase number.
     Shows if users spend more/less on 1st, 2nd, 3rd, 4th+ purchases.
+    Data is filtered to only include events after test start date.
     """
-    start_date = filters.get('start_date')
+    start_date = get_effective_start_date(filters)
     end_date = filters.get('end_date')
 
     # Build OS filter
@@ -630,21 +714,7 @@ def build_d2c_atv_by_purchase_number_query(filters: Dict[str, Any]) -> str:
         version_filter = f"AND ce.version_float IN ({version_values})"
 
     query = f"""
-    WITH d2c_test_users AS (
-        SELECT p.distinct_id
-        FROM `yotam-395120.peerplay.dim_player` p
-        JOIN (
-            SELECT distinct_id, MAX(version_float) as latest_version
-            FROM `yotam-395120.peerplay.vmp_master_event_normalized`
-            WHERE date >= DATE_SUB(CURRENT_DATE(), INTERVAL 30 DAY)
-              AND version_float IS NOT NULL AND version_float > 0
-            GROUP BY distinct_id
-        ) v ON p.distinct_id = v.distinct_id
-        WHERE p.first_country = 'US'
-          AND v.latest_version > 0.378
-          AND DATE_DIFF(CURRENT_DATE(), DATE(p.first_event_time), DAY) > 3
-          AND MOD(ABS(FARM_FINGERPRINT(p.distinct_id)), 100) < 20
-    ),
+    WITH {FIREBASE_SEGMENT_CTE}
     stash_purchases AS (
         SELECT
             ce.distinct_id,
@@ -696,14 +766,18 @@ def create_atv_by_purchase_chart(df: pd.DataFrame) -> go.Figure:
     if df.empty:
         return go.Figure()
 
+    # Convert to native Python types to avoid Plotly issues with numpy types
+    atv_values = [float(v) for v in df['avg_transaction_value']]
+    purchase_tiers = df['purchase_tier'].tolist()
+
     fig = go.Figure()
 
     fig.add_trace(go.Bar(
-        x=df['purchase_tier'],
-        y=df['avg_transaction_value'],
-        text=[f"${v:.2f}" for v in df['avg_transaction_value']],
+        x=purchase_tiers,
+        y=atv_values,
+        text=[f"${v:.2f}" for v in atv_values],
         textposition='outside',
-        marker=dict(color=['#3498db', '#2ecc71', '#f39c12', '#9b59b6'])
+        marker=dict(color=['#3498db', '#2ecc71', '#f39c12', '#9b59b6'][:len(atv_values)])
     ))
 
     fig.update_layout(
@@ -727,20 +801,21 @@ def create_d2c_adoption_funnel_chart(df: pd.DataFrame) -> tuple:
 
     row = df.iloc[0]
 
-    users_1st = int(row['users_1st_purchase'])
-    users_2nd = int(row['users_2nd_purchase'])
-    users_3rd = int(row['users_3rd_purchase'])
-    users_4th_plus = int(row['users_4th_plus_purchase'])
+    # Convert to native Python int to avoid Plotly issues with numpy types
+    users_1st = int(row['users_1st_purchase']) if pd.notna(row['users_1st_purchase']) else 0
+    users_2nd = int(row['users_2nd_purchase']) if pd.notna(row['users_2nd_purchase']) else 0
+    users_3rd = int(row['users_3rd_purchase']) if pd.notna(row['users_3rd_purchase']) else 0
+    users_4th_plus = int(row['users_4th_plus_purchase']) if pd.notna(row['users_4th_plus_purchase']) else 0
 
     # Calculate retention rates (step-by-step)
-    retention_1_to_2 = (users_2nd / users_1st * 100) if users_1st > 0 else 0
-    retention_2_to_3 = (users_3rd / users_2nd * 100) if users_2nd > 0 else 0
-    retention_3_to_4 = (users_4th_plus / users_3rd * 100) if users_3rd > 0 else 0
+    retention_1_to_2 = float((users_2nd / users_1st * 100) if users_1st > 0 else 0)
+    retention_2_to_3 = float((users_3rd / users_2nd * 100) if users_2nd > 0 else 0)
+    retention_3_to_4 = float((users_4th_plus / users_3rd * 100) if users_3rd > 0 else 0)
 
     # Calculate cumulative retention (from 1st purchase)
-    cumulative_2nd = (users_2nd / users_1st * 100) if users_1st > 0 else 0
-    cumulative_3rd = (users_3rd / users_1st * 100) if users_1st > 0 else 0
-    cumulative_4th = (users_4th_plus / users_1st * 100) if users_1st > 0 else 0
+    cumulative_2nd = float((users_2nd / users_1st * 100) if users_1st > 0 else 0)
+    cumulative_3rd = float((users_3rd / users_1st * 100) if users_1st > 0 else 0)
+    cumulative_4th = float((users_4th_plus / users_1st * 100) if users_1st > 0 else 0)
 
     metrics = {
         'users_1st': users_1st,
@@ -757,15 +832,31 @@ def create_d2c_adoption_funnel_chart(df: pd.DataFrame) -> tuple:
 
     fig = go.Figure()
 
-    fig.add_trace(go.Funnel(
-        name='D2C Adoption',
-        y=['1st D2C Purchase', '2nd D2C Purchase', '3rd D2C Purchase', '4th+ D2C Purchase'],
-        x=[users_1st, users_2nd, users_3rd, users_4th_plus],
-        textposition="inside",
-        textinfo="value+percent initial",
-        marker=dict(color=['#2ecc71', '#27ae60', '#1e8449', '#145a32']),
-        connector=dict(line=dict(color="#27ae60", width=2))
-    ))
+    # Build funnel data, filtering out zero values to avoid Plotly Funnel errors
+    labels = []
+    values = []
+    colors = []
+    all_labels = ['1st D2C Purchase', '2nd D2C Purchase', '3rd D2C Purchase', '4th+ D2C Purchase']
+    all_values = [users_1st, users_2nd, users_3rd, users_4th_plus]
+    all_colors = ['#2ecc71', '#27ae60', '#1e8449', '#145a32']
+
+    for i, (label, value, color) in enumerate(zip(all_labels, all_values, all_colors)):
+        if value > 0:
+            labels.append(label)
+            values.append(value)
+            colors.append(color)
+
+    # Only create funnel if we have at least one non-zero value
+    if values:
+        fig.add_trace(go.Funnel(
+            name='D2C Adoption',
+            y=labels,
+            x=values,
+            textposition="inside",
+            textinfo="value+percent initial",
+            marker=dict(color=colors),
+            connector=dict(line=dict(color="#27ae60", width=2))
+        ))
 
     fig.update_layout(
         title="D2C Adoption Funnel: Repeat Purchase Retention",
@@ -779,8 +870,9 @@ def create_d2c_adoption_funnel_chart(df: pd.DataFrame) -> tuple:
 def build_time_to_first_d2c_purchase_query(filters: Dict[str, Any]) -> str:
     """
     Build query to show distribution of days from install to first D2C purchase.
+    Data is filtered to only include events after test start date.
     """
-    start_date = filters.get('start_date')
+    start_date = get_effective_start_date(filters)
     end_date = filters.get('end_date')
 
     # Build OS filter
@@ -796,29 +888,20 @@ def build_time_to_first_d2c_purchase_query(filters: Dict[str, Any]) -> str:
         version_filter = f"AND ce.version_float IN ({version_values})"
 
     query = f"""
-    WITH d2c_test_users AS (
+    WITH {FIREBASE_SEGMENT_CTE}
+    d2c_test_users_with_install AS (
         SELECT
-            p.distinct_id,
+            t.distinct_id,
             DATE(p.first_event_time) as install_date
-        FROM `yotam-395120.peerplay.dim_player` p
-        JOIN (
-            SELECT distinct_id, MAX(version_float) as latest_version
-            FROM `yotam-395120.peerplay.vmp_master_event_normalized`
-            WHERE date >= DATE_SUB(CURRENT_DATE(), INTERVAL 30 DAY)
-              AND version_float IS NOT NULL AND version_float > 0
-            GROUP BY distinct_id
-        ) v ON p.distinct_id = v.distinct_id
-        WHERE p.first_country = 'US'
-          AND v.latest_version > 0.378
-          AND DATE_DIFF(CURRENT_DATE(), DATE(p.first_event_time), DAY) > 3
-          AND MOD(ABS(FARM_FINGERPRINT(p.distinct_id)), 100) < 20
+        FROM d2c_test_users t
+        JOIN `yotam-395120.peerplay.dim_player` p ON t.distinct_id = p.distinct_id
     ),
     first_d2c_purchase AS (
         SELECT
             ce.distinct_id,
             MIN(ce.date) as first_purchase_date
         FROM `yotam-395120.peerplay.vmp_master_event_normalized` ce
-        INNER JOIN d2c_test_users t ON ce.distinct_id = t.distinct_id
+        INNER JOIN d2c_test_users_with_install t ON ce.distinct_id = t.distinct_id
         WHERE ce.date >= DATE_SUB(DATE('{start_date}'), INTERVAL 365 DAY)
           AND ce.date <= '{end_date}'
           AND ce.mp_event_name = 'purchase_successful'
@@ -833,7 +916,7 @@ def build_time_to_first_d2c_purchase_query(filters: Dict[str, Any]) -> str:
             t.install_date,
             f.first_purchase_date,
             DATE_DIFF(f.first_purchase_date, t.install_date, DAY) as days_to_first_purchase
-        FROM d2c_test_users t
+        FROM d2c_test_users_with_install t
         INNER JOIN first_d2c_purchase f ON t.distinct_id = f.distinct_id
         WHERE f.first_purchase_date >= '{start_date}'
           AND f.first_purchase_date <= '{end_date}'
@@ -877,14 +960,16 @@ def create_time_to_first_purchase_chart(df: pd.DataFrame) -> go.Figure:
     if df.empty:
         return go.Figure()
 
-    total_users = df['users'].sum()
+    # Convert to native Python int to avoid Plotly issues with numpy types
+    total_users = int(df['users'].sum())
+    users_list = [int(u) for u in df['users']]
 
     fig = go.Figure()
 
     fig.add_trace(go.Bar(
-        x=df['days_bucket'],
-        y=df['users'],
-        text=[f"{u:,} ({u/total_users*100:.1f}%)" for u in df['users']],
+        x=df['days_bucket'].tolist(),
+        y=users_list,
+        text=[f"{u:,} ({u/total_users*100:.1f}%)" if total_users > 0 else "0" for u in users_list],
         textposition='outside',
         marker=dict(color='#3498db')
     ))
@@ -905,20 +990,22 @@ def get_time_to_first_purchase_stats(df: pd.DataFrame) -> dict:
     if df.empty:
         return {}
 
-    total_users = df['users'].sum()
+    # Convert to native Python types to avoid issues with numpy types
+    total_users = int(df['users'].sum())
 
     # Calculate weighted average
-    weighted_avg = sum(df['avg_days'] * df['users']) / total_users if total_users > 0 else 0
+    weighted_sum = sum(float(avg) * int(users) for avg, users in zip(df['avg_days'], df['users']))
+    weighted_avg = float(weighted_sum / total_users) if total_users > 0 else 0.0
 
     # Calculate users in each bucket
-    day_0_users = df[df['days_bucket'] == 'Day 0 (Same day)']['users'].sum() if 'Day 0 (Same day)' in df['days_bucket'].values else 0
-    week_1_users = df[df['bucket_order'] <= 4]['users'].sum()  # Day 0-7
+    day_0_users = int(df[df['days_bucket'] == 'Day 0 (Same day)']['users'].sum()) if 'Day 0 (Same day)' in df['days_bucket'].values else 0
+    week_1_users = int(df[df['bucket_order'] <= 4]['users'].sum())  # Day 0-7
 
     return {
         'total_users': total_users,
         'avg_days': weighted_avg,
-        'day_0_pct': (day_0_users / total_users * 100) if total_users > 0 else 0,
-        'week_1_pct': (week_1_users / total_users * 100) if total_users > 0 else 0
+        'day_0_pct': float(day_0_users / total_users * 100) if total_users > 0 else 0.0,
+        'week_1_pct': float(week_1_users / total_users * 100) if total_users > 0 else 0.0
     }
 
 
@@ -926,8 +1013,9 @@ def build_stash_funnel_execution_query(filters: Dict[str, Any]) -> str:
     """
     Build query for Stash funnel executions for D2C Test group only.
     Tracks the full Stash purchase funnel from purchase_click to rewards_store.
+    Data is filtered to only include events after test start date.
     """
-    start_date = filters.get('start_date')
+    start_date = get_effective_start_date(filters)
     end_date = filters.get('end_date')
 
     # Build OS filter
@@ -943,22 +1031,7 @@ def build_stash_funnel_execution_query(filters: Dict[str, Any]) -> str:
         version_filter = f"AND ce.version_float IN ({version_values})"
 
     query = f"""
-    WITH d2c_test_users AS (
-        -- Only Test group users (hash_bucket < 20)
-        SELECT p.distinct_id
-        FROM `yotam-395120.peerplay.dim_player` p
-        JOIN (
-            SELECT distinct_id, MAX(version_float) as latest_version
-            FROM `yotam-395120.peerplay.vmp_master_event_normalized`
-            WHERE date >= DATE_SUB(CURRENT_DATE(), INTERVAL 30 DAY)
-              AND version_float IS NOT NULL AND version_float > 0
-            GROUP BY distinct_id
-        ) v ON p.distinct_id = v.distinct_id
-        WHERE p.first_country = 'US'
-          AND v.latest_version > 0.378
-          AND DATE_DIFF(CURRENT_DATE(), DATE(p.first_event_time), DAY) > 3
-          AND MOD(ABS(FARM_FINGERPRINT(p.distinct_id)), 100) < 20
-    ),
+    WITH {FIREBASE_SEGMENT_CTE}
     client_events AS (
         SELECT
             ce.distinct_id,
@@ -1051,25 +1124,43 @@ def create_stash_funnel_execution_chart(df: pd.DataFrame) -> go.Figure:
 
     row = df.iloc[0]
 
+    # Helper function to safely convert to int
+    def safe_int(val):
+        return int(val) if pd.notna(val) else 0
+
     # Base count (purchase clicks)
-    base_count = row['funnels_purchase_click']
+    base_count = safe_int(row['funnels_purchase_click'])
     if base_count == 0:
         return go.Figure()
 
+    # Extract all values safely
+    funnels_purchase_click = safe_int(row['funnels_purchase_click'])
+    funnels_changed_selection = safe_int(row['funnels_changed_selection'])
+    funnels_stash_continue = safe_int(row['funnels_stash_continue'])
+    funnels_native_popup = safe_int(row['funnels_native_popup'])
+    funnels_webform_impression = safe_int(row['funnels_webform_impression'])
+    funnels_webform_add_card = safe_int(row['funnels_webform_add_card'])
+    funnels_webform_pay_click = safe_int(row['funnels_webform_pay_click'])
+    funnels_webform_success = safe_int(row['funnels_webform_success'])
+    funnels_client_success = safe_int(row['funnels_client_success'])
+    funnels_validation_request = safe_int(row['funnels_validation_request'])
+    funnels_validation_approval = safe_int(row['funnels_validation_approval'])
+    funnels_rewards_granted = safe_int(row['funnels_rewards_granted'])
+
     # Build metrics with counts and percentages
     metrics = [
-        ("Purchase Click", row['funnels_purchase_click'], 100.0),
-        ("Changed Selection", row['funnels_changed_selection'], (row['funnels_changed_selection'] / base_count) * 100),
-        ("Stash Continue", row['funnels_stash_continue'], (row['funnels_stash_continue'] / base_count) * 100),
-        ("Native Popup", row['funnels_native_popup'], (row['funnels_native_popup'] / base_count) * 100),
-        ("Webform Impression", row['funnels_webform_impression'], (row['funnels_webform_impression'] / base_count) * 100),
-        ("Webform Add Card", row['funnels_webform_add_card'], (row['funnels_webform_add_card'] / base_count) * 100),
-        ("Webform Pay Click", row['funnels_webform_pay_click'], (row['funnels_webform_pay_click'] / base_count) * 100),
-        ("Webform Success", row['funnels_webform_success'], (row['funnels_webform_success'] / base_count) * 100),
-        ("Client Success", row['funnels_client_success'], (row['funnels_client_success'] / base_count) * 100),
-        ("Validation Request", row['funnels_validation_request'], (row['funnels_validation_request'] / base_count) * 100),
-        ("Validation Approval", row['funnels_validation_approval'], (row['funnels_validation_approval'] / base_count) * 100),
-        ("Rewards Granted", row['funnels_rewards_granted'], (row['funnels_rewards_granted'] / base_count) * 100),
+        ("Purchase Click", funnels_purchase_click, 100.0),
+        ("Changed Selection", funnels_changed_selection, (funnels_changed_selection / base_count) * 100),
+        ("Stash Continue", funnels_stash_continue, (funnels_stash_continue / base_count) * 100),
+        ("Native Popup", funnels_native_popup, (funnels_native_popup / base_count) * 100),
+        ("Webform Impression", funnels_webform_impression, (funnels_webform_impression / base_count) * 100),
+        ("Webform Add Card", funnels_webform_add_card, (funnels_webform_add_card / base_count) * 100),
+        ("Webform Pay Click", funnels_webform_pay_click, (funnels_webform_pay_click / base_count) * 100),
+        ("Webform Success", funnels_webform_success, (funnels_webform_success / base_count) * 100),
+        ("Client Success", funnels_client_success, (funnels_client_success / base_count) * 100),
+        ("Validation Request", funnels_validation_request, (funnels_validation_request / base_count) * 100),
+        ("Validation Approval", funnels_validation_approval, (funnels_validation_approval / base_count) * 100),
+        ("Rewards Granted", funnels_rewards_granted, (funnels_rewards_granted / base_count) * 100),
     ]
 
     labels = [m[0] for m in metrics]
@@ -1110,26 +1201,464 @@ def get_stash_funnel_metrics(df: pd.DataFrame) -> dict:
         return {}
 
     row = df.iloc[0]
-    base_count = row['funnels_purchase_click']
+
+    # Helper function to safely convert to int
+    def safe_int(val):
+        return int(val) if pd.notna(val) else 0
+
+    base_count = safe_int(row['funnels_purchase_click'])
 
     if base_count == 0:
         return {}
 
+    # Extract values safely
+    funnels_stash_continue = safe_int(row['funnels_stash_continue'])
+    funnels_webform_impression = safe_int(row['funnels_webform_impression'])
+    funnels_webform_pay_click = safe_int(row['funnels_webform_pay_click'])
+    funnels_client_success = safe_int(row['funnels_client_success'])
+
     # Calculate key conversion rates
-    continue_rate = (row['funnels_stash_continue'] / base_count * 100) if base_count > 0 else 0
-    webform_rate = (row['funnels_webform_impression'] / row['funnels_stash_continue'] * 100) if row['funnels_stash_continue'] > 0 else 0
-    pay_click_rate = (row['funnels_webform_pay_click'] / row['funnels_webform_impression'] * 100) if row['funnels_webform_impression'] > 0 else 0
-    success_rate = (row['funnels_client_success'] / row['funnels_webform_pay_click'] * 100) if row['funnels_webform_pay_click'] > 0 else 0
-    overall_conversion = (row['funnels_client_success'] / base_count * 100) if base_count > 0 else 0
+    continue_rate = (funnels_stash_continue / base_count * 100) if base_count > 0 else 0
+    webform_rate = (funnels_webform_impression / funnels_stash_continue * 100) if funnels_stash_continue > 0 else 0
+    pay_click_rate = (funnels_webform_pay_click / funnels_webform_impression * 100) if funnels_webform_impression > 0 else 0
+    success_rate = (funnels_client_success / funnels_webform_pay_click * 100) if funnels_webform_pay_click > 0 else 0
+    overall_conversion = (funnels_client_success / base_count * 100) if base_count > 0 else 0
 
     return {
-        'purchase_clicks': int(row['funnels_purchase_click']),
-        'stash_continues': int(row['funnels_stash_continue']),
-        'webform_impressions': int(row['funnels_webform_impression']),
-        'purchases': int(row['funnels_client_success']),
-        'continue_rate': continue_rate,
-        'webform_rate': webform_rate,
-        'pay_click_rate': pay_click_rate,
-        'success_rate': success_rate,
-        'overall_conversion': overall_conversion
+        'purchase_clicks': base_count,
+        'stash_continues': funnels_stash_continue,
+        'webform_impressions': funnels_webform_impression,
+        'purchases': funnels_client_success,
+        'continue_rate': float(continue_rate),
+        'webform_rate': float(webform_rate),
+        'pay_click_rate': float(pay_click_rate),
+        'success_rate': float(success_rate),
+        'overall_conversion': float(overall_conversion)
     }
+
+
+def build_test_vs_control_funnel_query(filters: Dict[str, Any]) -> str:
+    """
+    Build query to compare Test vs Control group funnels.
+    Shows purchase clicks and purchase success for both groups.
+    """
+    start_date = get_effective_start_date(filters)
+    end_date = filters.get('end_date')
+
+    query = f"""
+    WITH {FIREBASE_SEGMENT_CTE}
+    funnel_events AS (
+        SELECT
+            ce.distinct_id,
+            ce.purchase_funnel_id,
+            ce.mp_event_name,
+            ce.payment_platform,
+            ce.price_usd,
+            ce.purchase_id,
+            ce.google_order_number,
+            CASE
+                WHEN t.distinct_id IS NOT NULL THEN 'Test'
+                WHEN c.distinct_id IS NOT NULL THEN 'Control'
+            END as segment
+        FROM `yotam-395120.peerplay.vmp_master_event_normalized` ce
+        LEFT JOIN d2c_test_users t ON ce.distinct_id = t.distinct_id
+        LEFT JOIN d2c_control_users c ON ce.distinct_id = c.distinct_id
+        WHERE ce.date >= '{start_date}'
+          AND ce.date <= '{end_date}'
+          AND ce.mp_event_name IN ('purchase_click', 'purchase_successful')
+          AND (t.distinct_id IS NOT NULL OR c.distinct_id IS NOT NULL)
+    )
+    SELECT
+        segment,
+        COUNT(DISTINCT CASE WHEN mp_event_name = 'purchase_click' THEN purchase_funnel_id END) as purchase_clicks,
+        COUNT(DISTINCT CASE WHEN mp_event_name = 'purchase_successful' THEN purchase_funnel_id END) as total_purchases,
+        COUNT(DISTINCT CASE
+            WHEN mp_event_name = 'purchase_successful' AND payment_platform = 'stash'
+            THEN purchase_funnel_id
+        END) as stash_purchases,
+        COUNT(DISTINCT CASE
+            WHEN mp_event_name = 'purchase_successful' AND payment_platform IN ('apple', 'googleplay')
+              AND ((payment_platform = 'apple' AND purchase_id IS NOT NULL AND purchase_id != '')
+                OR (payment_platform = 'googleplay' AND google_order_number IS NOT NULL AND google_order_number != ''))
+            THEN purchase_funnel_id
+        END) as iap_purchases,
+        SUM(CASE WHEN mp_event_name = 'purchase_successful' THEN COALESCE(price_usd, 0) ELSE 0 END) as total_revenue
+    FROM funnel_events
+    GROUP BY segment
+    ORDER BY segment DESC
+    """
+    return query
+
+
+def get_test_vs_control_funnel_data(filters: Dict[str, Any]) -> pd.DataFrame:
+    """Execute Test vs Control comparison query."""
+    query = build_test_vs_control_funnel_query(filters)
+    return run_query(query)
+
+
+def create_test_vs_control_funnel_chart(df: pd.DataFrame) -> go.Figure:
+    """Create side-by-side bar chart comparing Test vs Control funnels."""
+    if df.empty:
+        return go.Figure()
+
+    # Extract data for each segment
+    test_data = df[df['segment'] == 'Test'].iloc[0] if len(df[df['segment'] == 'Test']) > 0 else None
+    control_data = df[df['segment'] == 'Control'].iloc[0] if len(df[df['segment'] == 'Control']) > 0 else None
+
+    if test_data is None and control_data is None:
+        return go.Figure()
+
+    def safe_int(val):
+        return int(val) if pd.notna(val) else 0
+
+    # Get values
+    test_clicks = safe_int(test_data['purchase_clicks']) if test_data is not None else 0
+    test_purchases = safe_int(test_data['total_purchases']) if test_data is not None else 0
+    control_clicks = safe_int(control_data['purchase_clicks']) if control_data is not None else 0
+    control_purchases = safe_int(control_data['total_purchases']) if control_data is not None else 0
+
+    # Calculate conversion rates
+    test_conv = (test_purchases / test_clicks * 100) if test_clicks > 0 else 0
+    control_conv = (control_purchases / control_clicks * 100) if control_clicks > 0 else 0
+
+    fig = go.Figure()
+
+    # Test group bars
+    fig.add_trace(go.Bar(
+        name='Test Group',
+        x=['Purchase Clicks', 'Purchases'],
+        y=[test_clicks, test_purchases],
+        text=[f'{test_clicks:,}', f'{test_purchases:,}<br>({test_conv:.1f}%)'],
+        textposition='outside',
+        marker_color='#2ecc71'
+    ))
+
+    # Control group bars
+    fig.add_trace(go.Bar(
+        name='Control Group',
+        x=['Purchase Clicks', 'Purchases'],
+        y=[control_clicks, control_purchases],
+        text=[f'{control_clicks:,}', f'{control_purchases:,}<br>({control_conv:.1f}%)'],
+        textposition='outside',
+        marker_color='#3498db'
+    ))
+
+    fig.update_layout(
+        title="📊 Test vs Control: Purchase Funnel Comparison",
+        barmode='group',
+        height=400,
+        xaxis_title="Funnel Step",
+        yaxis_title="Count",
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1)
+    )
+
+    return fig
+
+
+def build_stash_to_iap_users_query(filters: Dict[str, Any]) -> str:
+    """
+    Build query to find users who purchased via Stash first and then IAP later.
+    These are users who tried D2C and then switched to IAP.
+    """
+    start_date = get_effective_start_date(filters)
+    end_date = filters.get('end_date')
+
+    # Build OS filter
+    os_filter = ""
+    if filters.get('mp_os'):
+        os_values = ", ".join([f"'{os}'" for os in filters['mp_os']])
+        os_filter = f"AND ce.mp_os IN ({os_values})"
+
+    # Build version filter
+    version_filter = ""
+    if filters.get('version'):
+        version_values = ", ".join([str(v) for v in filters['version']])
+        version_filter = f"AND ce.version_float IN ({version_values})"
+
+    query = f"""
+    WITH {FIREBASE_SEGMENT_CTE}
+    all_purchases AS (
+        SELECT
+            ce.distinct_id,
+            ce.date as purchase_date,
+            ce.time as purchase_time,
+            ce.payment_platform,
+            ce.price_usd,
+            ce.purchase_funnel_id
+        FROM `yotam-395120.peerplay.vmp_master_event_normalized` ce
+        INNER JOIN d2c_test_users t ON ce.distinct_id = t.distinct_id
+        WHERE ce.date >= '{start_date}'
+          AND ce.date <= '{end_date}'
+          AND ce.mp_event_name = 'purchase_successful'
+          AND ce.payment_platform IN ('stash', 'apple', 'googleplay')
+          {os_filter}
+          {version_filter}
+    ),
+    user_purchase_history AS (
+        SELECT
+            distinct_id,
+            MIN(CASE WHEN payment_platform = 'stash' THEN purchase_date END) as first_stash_date,
+            MIN(CASE WHEN payment_platform IN ('apple', 'googleplay') THEN purchase_date END) as first_iap_date,
+            COUNT(CASE WHEN payment_platform = 'stash' THEN 1 END) as stash_purchase_count,
+            COUNT(CASE WHEN payment_platform IN ('apple', 'googleplay') THEN 1 END) as iap_purchase_count,
+            SUM(CASE WHEN payment_platform = 'stash' THEN COALESCE(price_usd, 0) ELSE 0 END) as stash_revenue,
+            SUM(CASE WHEN payment_platform IN ('apple', 'googleplay') THEN COALESCE(price_usd, 0) ELSE 0 END) as iap_revenue
+        FROM all_purchases
+        GROUP BY distinct_id
+    )
+    SELECT
+        distinct_id,
+        first_stash_date,
+        first_iap_date,
+        stash_purchase_count,
+        iap_purchase_count,
+        stash_revenue,
+        iap_revenue,
+        DATE_DIFF(first_iap_date, first_stash_date, DAY) as days_between
+    FROM user_purchase_history
+    WHERE first_stash_date IS NOT NULL
+      AND first_iap_date IS NOT NULL
+      AND first_iap_date >= first_stash_date  -- IAP purchase came after Stash
+    ORDER BY first_stash_date DESC
+    LIMIT 200
+    """
+    return query
+
+
+def get_stash_to_iap_users(filters: Dict[str, Any]) -> pd.DataFrame:
+    """Get users who purchased via Stash and then IAP."""
+    query = build_stash_to_iap_users_query(filters)
+    return run_query(query)
+
+
+def get_stash_to_iap_summary(filters: Dict[str, Any]) -> Dict[str, Any]:
+    """Get summary statistics for Stash to IAP users."""
+    start_date = get_effective_start_date(filters)
+    end_date = filters.get('end_date')
+
+    # Build OS filter
+    os_filter = ""
+    if filters.get('mp_os'):
+        os_values = ", ".join([f"'{os}'" for os in filters['mp_os']])
+        os_filter = f"AND ce.mp_os IN ({os_values})"
+
+    # Build version filter
+    version_filter = ""
+    if filters.get('version'):
+        version_values = ", ".join([str(v) for v in filters['version']])
+        version_filter = f"AND ce.version_float IN ({version_values})"
+
+    query = f"""
+    WITH {FIREBASE_SEGMENT_CTE}
+    all_purchases AS (
+        SELECT
+            ce.distinct_id,
+            ce.date as purchase_date,
+            ce.payment_platform
+        FROM `yotam-395120.peerplay.vmp_master_event_normalized` ce
+        INNER JOIN d2c_test_users t ON ce.distinct_id = t.distinct_id
+        WHERE ce.date >= '{start_date}'
+          AND ce.date <= '{end_date}'
+          AND ce.mp_event_name = 'purchase_successful'
+          AND ce.payment_platform IN ('stash', 'apple', 'googleplay')
+          {os_filter}
+          {version_filter}
+    ),
+    user_purchase_history AS (
+        SELECT
+            distinct_id,
+            MIN(CASE WHEN payment_platform = 'stash' THEN purchase_date END) as first_stash_date,
+            MIN(CASE WHEN payment_platform IN ('apple', 'googleplay') THEN purchase_date END) as first_iap_date
+        FROM all_purchases
+        GROUP BY distinct_id
+    ),
+    user_categories AS (
+        SELECT
+            distinct_id,
+            CASE
+                WHEN first_stash_date IS NOT NULL AND first_iap_date IS NULL THEN 'stash_only'
+                WHEN first_stash_date IS NULL AND first_iap_date IS NOT NULL THEN 'iap_only'
+                WHEN first_stash_date IS NOT NULL AND first_iap_date IS NOT NULL AND first_iap_date >= first_stash_date THEN 'stash_then_iap'
+                WHEN first_stash_date IS NOT NULL AND first_iap_date IS NOT NULL AND first_iap_date < first_stash_date THEN 'iap_then_stash'
+            END as category
+        FROM user_purchase_history
+    )
+    SELECT
+        category,
+        COUNT(*) as user_count
+    FROM user_categories
+    WHERE category IS NOT NULL
+    GROUP BY category
+    """
+    df = run_query(query)
+
+    result = {
+        'stash_only': 0,
+        'iap_only': 0,
+        'stash_then_iap': 0,
+        'iap_then_stash': 0
+    }
+
+    if not df.empty:
+        for _, row in df.iterrows():
+            if row['category'] in result:
+                result[row['category']] = int(row['user_count'])
+
+    return result
+
+
+def get_stash_then_iap_behavior(filters: Dict[str, Any]) -> pd.DataFrame:
+    """
+    Get breakdown of stash_then_iap users - did they return to Stash after IAP?
+    Returns summary of users who returned vs those who never returned.
+    """
+    start_date = get_effective_start_date(filters)
+    end_date = filters.get('end_date')
+
+    # Build OS filter
+    os_filter = ""
+    if filters.get('mp_os'):
+        os_values = ", ".join([f"'{os}'" for os in filters['mp_os']])
+        os_filter = f"AND ce.mp_os IN ({os_values})"
+
+    # Build version filter
+    version_filter = ""
+    if filters.get('version'):
+        version_values = ", ".join([str(v) for v in filters['version']])
+        version_filter = f"AND ce.version_float IN ({version_values})"
+
+    query = f"""
+    WITH {FIREBASE_SEGMENT_CTE}
+    all_purchases AS (
+        SELECT
+            ce.distinct_id,
+            ce.date as purchase_date,
+            ce.payment_platform
+        FROM `yotam-395120.peerplay.vmp_master_event_normalized` ce
+        INNER JOIN d2c_test_users t ON ce.distinct_id = t.distinct_id
+        WHERE ce.date >= '{start_date}'
+          AND ce.date <= '{end_date}'
+          AND ce.mp_event_name = 'purchase_successful'
+          AND ce.payment_platform IN ('stash', 'apple', 'googleplay')
+          {os_filter}
+          {version_filter}
+    ),
+    user_purchase_timeline AS (
+        SELECT
+            distinct_id,
+            MIN(CASE WHEN payment_platform = 'stash' THEN purchase_date END) as first_stash_date,
+            MIN(CASE WHEN payment_platform IN ('apple', 'googleplay') THEN purchase_date END) as first_iap_date
+        FROM all_purchases
+        GROUP BY distinct_id
+    ),
+    stash_then_iap_users AS (
+        SELECT distinct_id, first_stash_date, first_iap_date
+        FROM user_purchase_timeline
+        WHERE first_stash_date IS NOT NULL
+          AND first_iap_date IS NOT NULL
+          AND first_iap_date >= first_stash_date
+    ),
+    stash_after_iap AS (
+        SELECT
+            s.distinct_id,
+            COUNT(CASE WHEN p.payment_platform = 'stash' AND p.purchase_date > s.first_iap_date THEN 1 END) as stash_purchases_after_iap,
+            COUNT(CASE WHEN p.payment_platform IN ('apple', 'googleplay') AND p.purchase_date > s.first_iap_date THEN 1 END) as iap_purchases_after_first_iap
+        FROM stash_then_iap_users s
+        LEFT JOIN all_purchases p ON s.distinct_id = p.distinct_id
+        GROUP BY s.distinct_id
+    )
+    SELECT
+        CASE
+            WHEN stash_purchases_after_iap > 0 THEN 'Returned to Stash'
+            ELSE 'Never returned to Stash'
+        END as behavior,
+        COUNT(DISTINCT distinct_id) as users,
+        SUM(stash_purchases_after_iap) as stash_purchases_after_iap,
+        SUM(iap_purchases_after_first_iap) as iap_purchases_after_first_iap
+    FROM stash_after_iap
+    GROUP BY 1
+    ORDER BY 1
+    """
+    return run_query(query)
+
+
+def get_stash_then_iap_user_details(filters: Dict[str, Any]) -> pd.DataFrame:
+    """
+    Get detailed info for stash_then_iap users including whether they returned to Stash.
+    """
+    start_date = get_effective_start_date(filters)
+    end_date = filters.get('end_date')
+
+    # Build OS filter
+    os_filter = ""
+    if filters.get('mp_os'):
+        os_values = ", ".join([f"'{os}'" for os in filters['mp_os']])
+        os_filter = f"AND ce.mp_os IN ({os_values})"
+
+    # Build version filter
+    version_filter = ""
+    if filters.get('version'):
+        version_values = ", ".join([str(v) for v in filters['version']])
+        version_filter = f"AND ce.version_float IN ({version_values})"
+
+    query = f"""
+    WITH {FIREBASE_SEGMENT_CTE}
+    all_purchases AS (
+        SELECT
+            ce.distinct_id,
+            ce.date as purchase_date,
+            ce.payment_platform,
+            ce.price_usd
+        FROM `yotam-395120.peerplay.vmp_master_event_normalized` ce
+        INNER JOIN d2c_test_users t ON ce.distinct_id = t.distinct_id
+        WHERE ce.date >= '{start_date}'
+          AND ce.date <= '{end_date}'
+          AND ce.mp_event_name = 'purchase_successful'
+          AND ce.payment_platform IN ('stash', 'apple', 'googleplay')
+          {os_filter}
+          {version_filter}
+    ),
+    user_purchase_timeline AS (
+        SELECT
+            distinct_id,
+            MIN(CASE WHEN payment_platform = 'stash' THEN purchase_date END) as first_stash_date,
+            MIN(CASE WHEN payment_platform IN ('apple', 'googleplay') THEN purchase_date END) as first_iap_date
+        FROM all_purchases
+        GROUP BY distinct_id
+    ),
+    stash_then_iap_users AS (
+        SELECT distinct_id, first_stash_date, first_iap_date
+        FROM user_purchase_timeline
+        WHERE first_stash_date IS NOT NULL
+          AND first_iap_date IS NOT NULL
+          AND first_iap_date >= first_stash_date
+    ),
+    user_full_history AS (
+        SELECT
+            s.distinct_id,
+            s.first_stash_date,
+            s.first_iap_date,
+            COUNT(CASE WHEN p.payment_platform = 'stash' AND p.purchase_date <= s.first_iap_date THEN 1 END) as stash_before_iap,
+            COUNT(CASE WHEN p.payment_platform = 'stash' AND p.purchase_date > s.first_iap_date THEN 1 END) as stash_after_iap,
+            COUNT(CASE WHEN p.payment_platform IN ('apple', 'googleplay') THEN 1 END) as total_iap,
+            ROUND(SUM(CASE WHEN p.payment_platform = 'stash' THEN COALESCE(p.price_usd, 0) ELSE 0 END), 2) as stash_revenue,
+            ROUND(SUM(CASE WHEN p.payment_platform IN ('apple', 'googleplay') THEN COALESCE(p.price_usd, 0) ELSE 0 END), 2) as iap_revenue
+        FROM stash_then_iap_users s
+        LEFT JOIN all_purchases p ON s.distinct_id = p.distinct_id
+        GROUP BY s.distinct_id, s.first_stash_date, s.first_iap_date
+    )
+    SELECT
+        distinct_id,
+        first_stash_date,
+        first_iap_date,
+        stash_before_iap,
+        stash_after_iap,
+        total_iap,
+        stash_revenue,
+        iap_revenue,
+        CASE WHEN stash_after_iap > 0 THEN 'Yes' ELSE 'No' END as returned_to_stash
+    FROM user_full_history
+    ORDER BY stash_after_iap DESC, first_stash_date
+    LIMIT 200
+    """
+    return run_query(query)

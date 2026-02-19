@@ -1,19 +1,45 @@
 """D2C Test Segmentation utilities for Test vs Control analysis."""
 
-from typing import Optional
+from typing import Optional, Dict, Any
 from utils.bigquery_client import run_query
 import pandas as pd
 
 
+def get_effective_start_date(filters: Dict[str, Any]) -> str:
+    """
+    Get the effective start date considering the test start date.
+    Returns the later of start_date and test_start_date.
+    If test hasn't started yet (test_start_date > end_date), returns start_date.
+    """
+    start_date = filters.get('start_date')
+    end_date = filters.get('end_date')
+    test_start_date = filters.get('test_start_date')
+
+    # If no test_start_date, use start_date
+    if not test_start_date:
+        return start_date
+
+    # If test_start_date is after end_date, test hasn't started yet - use original start_date
+    if str(test_start_date) > str(end_date):
+        return start_date
+
+    # Compare as strings (YYYY-MM-DD format allows string comparison)
+    if str(start_date) < str(test_start_date):
+        return test_start_date
+    return start_date
+
+
 def get_d2c_segment_query(segment: Optional[str] = None) -> str:
     """
-    Build query for D2C Test Segmentation.
+    Build query for D2C Test Segmentation using Firebase Remote Config segments.
+
+    Segmentation based on Firebase segments:
+    - LiveOpsData.stash_test -> test group
+    - LiveOpsData.stash_control -> control group
 
     Conditions:
-    - US users (first_country = 'US')
-    - Version > 0.378 (latest version in last 30 days)
-    - Days since install > 3
-    - 20% test / 80% control (based on distinct_id hash)
+    - US users only (first_country = 'US')
+    - Has firebase segment assignment (stash_test or stash_control)
 
     Args:
         segment: Optional - 'test', 'control', or None for all
@@ -23,52 +49,47 @@ def get_d2c_segment_query(segment: Optional[str] = None) -> str:
     """
     # Segment filter
     if segment == 'test':
-        segment_filter = "AND hash_bucket < 20"
+        segment_filter = "AND segment = 'test'"
     elif segment == 'control':
-        segment_filter = "AND hash_bucket >= 20"
+        segment_filter = "AND segment = 'control'"
     else:
         segment_filter = ""
 
     query = f"""
-    WITH user_latest_version AS (
-        -- Get latest version for each user (last 30 days for better coverage)
+    WITH firebase_segment_events AS (
+        -- Get all dynamic_configuration_loaded events with stash segments
         SELECT
             distinct_id,
-            MAX(version_float) as latest_version,
-            MAX(date) as last_active_date
+            date,
+            time,
+            firebase_segments,
+            CASE
+                WHEN firebase_segments LIKE '%LiveOpsData.stash_test%' THEN 'test'
+                WHEN firebase_segments LIKE '%LiveOpsData.stash_control%' THEN 'control'
+            END as segment,
+            ROW_NUMBER() OVER (PARTITION BY distinct_id ORDER BY date DESC, time DESC) as rn
         FROM `yotam-395120.peerplay.vmp_master_event_normalized`
-        WHERE date >= DATE_SUB(CURRENT_DATE(), INTERVAL 30 DAY)
-          AND version_float IS NOT NULL
-          AND version_float > 0
-        GROUP BY distinct_id
+        WHERE mp_event_name = 'dynamic_configuration_loaded'
+          AND date >= DATE_SUB(CURRENT_DATE(), INTERVAL 30 DAY)
+          AND (firebase_segments LIKE '%LiveOpsData.stash_test%'
+               OR firebase_segments LIKE '%LiveOpsData.stash_control%')
     ),
-    eligible_users AS (
+    user_segments AS (
+        -- Get latest segment for each user
+        SELECT distinct_id, segment, date as segment_date
+        FROM firebase_segment_events
+        WHERE rn = 1
+    ),
+    segmented_users AS (
         SELECT
             p.distinct_id,
             p.first_event_time,
             DATE_DIFF(CURRENT_DATE(), DATE(p.first_event_time), DAY) as days_since_install,
-            v.latest_version,
-            v.last_active_date,
-            MOD(ABS(FARM_FINGERPRINT(p.distinct_id)), 100) as hash_bucket
+            us.segment,
+            us.segment_date
         FROM `yotam-395120.peerplay.dim_player` p
-        JOIN user_latest_version v ON p.distinct_id = v.distinct_id
+        INNER JOIN user_segments us ON p.distinct_id = us.distinct_id
         WHERE p.first_country = 'US'
-          AND v.latest_version > 0.378
-    ),
-    segmented_users AS (
-        SELECT
-            distinct_id,
-            first_event_time,
-            days_since_install,
-            latest_version,
-            last_active_date,
-            hash_bucket,
-            CASE
-                WHEN hash_bucket < 20 THEN 'test'
-                ELSE 'control'
-            END as segment
-        FROM eligible_users
-        WHERE days_since_install > 3
     )
     SELECT * FROM segmented_users
     WHERE 1=1
@@ -95,14 +116,16 @@ def get_d2c_users(segment: Optional[str] = None) -> pd.DataFrame:
 def get_d2c_segment_stats(filters: dict) -> pd.DataFrame:
     """
     Get statistics about D2C segments - active users in the date range.
+    Uses Firebase Remote Config segments (stash_test / stash_control).
+    Data is filtered to only include events after test start date.
 
     Args:
-        filters: Dictionary with filter values (start_date, end_date, mp_os, version)
+        filters: Dictionary with filter values (start_date, end_date, mp_os, version, test_start_date)
 
     Returns:
         DataFrame with segment counts and percentages
     """
-    start_date = filters.get('start_date')
+    start_date = get_effective_start_date(filters)
     end_date = filters.get('end_date')
 
     # Build OS filter
@@ -118,23 +141,38 @@ def get_d2c_segment_stats(filters: dict) -> pd.DataFrame:
         version_filter = f"AND ce.version_float IN ({version_values})"
 
     query = f"""
-    WITH d2c_eligible_users AS (
-        -- D2C eligible users (US, version > 0.378, days > 3)
+    WITH firebase_segment_events AS (
+        -- Get all dynamic_configuration_loaded events with stash segments
+        SELECT
+            distinct_id,
+            date,
+            time,
+            CASE
+                WHEN firebase_segments LIKE '%LiveOpsData.stash_test%' THEN 'test'
+                WHEN firebase_segments LIKE '%LiveOpsData.stash_control%' THEN 'control'
+            END as segment,
+            ROW_NUMBER() OVER (PARTITION BY distinct_id ORDER BY date DESC, time DESC) as rn
+        FROM `yotam-395120.peerplay.vmp_master_event_normalized`
+        WHERE mp_event_name = 'dynamic_configuration_loaded'
+          AND date >= DATE_SUB(CURRENT_DATE(), INTERVAL 30 DAY)
+          AND (firebase_segments LIKE '%LiveOpsData.stash_test%'
+               OR firebase_segments LIKE '%LiveOpsData.stash_control%')
+    ),
+    user_segments AS (
+        -- Get latest segment for each user
+        SELECT us.distinct_id, us.segment
+        FROM firebase_segment_events us
+        WHERE us.rn = 1
+    ),
+    d2c_eligible_users AS (
+        -- D2C eligible users (US, has firebase segment)
         SELECT
             p.distinct_id,
             DATE_DIFF(CURRENT_DATE(), DATE(p.first_event_time), DAY) as days_since_install,
-            MOD(ABS(FARM_FINGERPRINT(p.distinct_id)), 100) as hash_bucket
+            us.segment
         FROM `yotam-395120.peerplay.dim_player` p
-        JOIN (
-            SELECT distinct_id, MAX(version_float) as latest_version
-            FROM `yotam-395120.peerplay.vmp_master_event_normalized`
-            WHERE date >= DATE_SUB(CURRENT_DATE(), INTERVAL 30 DAY)
-              AND version_float IS NOT NULL AND version_float > 0
-            GROUP BY distinct_id
-        ) v ON p.distinct_id = v.distinct_id
+        INNER JOIN user_segments us ON p.distinct_id = us.distinct_id
         WHERE p.first_country = 'US'
-          AND v.latest_version > 0.378
-          AND DATE_DIFF(CURRENT_DATE(), DATE(p.first_event_time), DAY) > 3
     ),
     active_users AS (
         -- Users who were active in the date range with the selected filters
@@ -147,7 +185,7 @@ def get_d2c_segment_stats(filters: dict) -> pd.DataFrame:
           {version_filter}
     )
     SELECT
-        CASE WHEN d2c.hash_bucket < 20 THEN 'test' ELSE 'control' END as segment,
+        d2c.segment,
         COUNT(DISTINCT d2c.distinct_id) as users,
         ROUND(AVG(d2c.days_since_install), 1) as avg_days_since_install
     FROM d2c_eligible_users d2c
@@ -161,41 +199,39 @@ def get_d2c_segment_stats(filters: dict) -> pd.DataFrame:
 def get_d2c_daily_new_users() -> pd.DataFrame:
     """
     Get daily count of new users entering each segment.
-    Shows how many users become eligible each day (after 3 days from install).
+    Shows how many users got assigned to each Firebase segment per day.
 
     Returns:
         DataFrame with daily new user counts per segment
     """
     query = """
-    WITH user_latest_version AS (
+    WITH firebase_segment_events AS (
+        -- Get first segment assignment for each user
         SELECT
             distinct_id,
-            MAX(version_float) as latest_version
+            date as segment_date,
+            CASE
+                WHEN firebase_segments LIKE '%LiveOpsData.stash_test%' THEN 'test'
+                WHEN firebase_segments LIKE '%LiveOpsData.stash_control%' THEN 'control'
+            END as segment,
+            ROW_NUMBER() OVER (PARTITION BY distinct_id ORDER BY date ASC, time ASC) as rn
         FROM `yotam-395120.peerplay.vmp_master_event_normalized`
-        WHERE date >= DATE_SUB(CURRENT_DATE(), INTERVAL 30 DAY)
-          AND version_float IS NOT NULL
-          AND version_float > 0
-        GROUP BY distinct_id
+        WHERE mp_event_name = 'dynamic_configuration_loaded'
+          AND date >= DATE_SUB(CURRENT_DATE(), INTERVAL 30 DAY)
+          AND (firebase_segments LIKE '%LiveOpsData.stash_test%'
+               OR firebase_segments LIKE '%LiveOpsData.stash_control%')
     ),
-    eligible_users AS (
-        SELECT
-            p.distinct_id,
-            DATE(p.first_event_time) as install_date,
-            DATE_ADD(DATE(p.first_event_time), INTERVAL 4 DAY) as eligible_date,
-            v.latest_version,
-            MOD(ABS(FARM_FINGERPRINT(p.distinct_id)), 100) as hash_bucket
-        FROM `yotam-395120.peerplay.dim_player` p
-        JOIN user_latest_version v ON p.distinct_id = v.distinct_id
-        WHERE p.first_country = 'US'
-          AND v.latest_version > 0.378
-          AND DATE_DIFF(CURRENT_DATE(), DATE(p.first_event_time), DAY) > 3
+    first_segment_assignment AS (
+        SELECT distinct_id, segment_date, segment
+        FROM firebase_segment_events
+        WHERE rn = 1
     )
     SELECT
-        eligible_date,
-        CASE WHEN hash_bucket < 20 THEN 'test' ELSE 'control' END as segment,
+        segment_date,
+        segment,
         COUNT(DISTINCT distinct_id) as new_users
-    FROM eligible_users
-    WHERE eligible_date >= DATE_SUB(CURRENT_DATE(), INTERVAL 14 DAY)
+    FROM first_segment_assignment
+    WHERE segment_date >= DATE_SUB(CURRENT_DATE(), INTERVAL 14 DAY)
     GROUP BY 1, 2
     ORDER BY 1 DESC, 2
     """
@@ -206,14 +242,16 @@ def get_d2c_purchase_summary(filters: dict) -> pd.DataFrame:
     """
     Get purchase summary for D2C eligible users.
     Shows total revenue, D2C (Stash) revenue, and IAP revenue.
+    Uses Firebase Remote Config segments.
+    Data is filtered to only include events after test start date.
 
     Args:
-        filters: Dictionary with filter values (start_date, end_date, mp_os, version)
+        filters: Dictionary with filter values (start_date, end_date, mp_os, version, test_start_date)
 
     Returns:
         DataFrame with purchase summary metrics
     """
-    start_date = filters.get('start_date')
+    start_date = get_effective_start_date(filters)
     end_date = filters.get('end_date')
 
     # Build OS filter
@@ -229,24 +267,35 @@ def get_d2c_purchase_summary(filters: dict) -> pd.DataFrame:
         version_filter = f"AND ce.version_float IN ({version_values})"
 
     query = f"""
-    WITH d2c_eligible_users AS (
+    WITH firebase_segment_events AS (
+        -- Get all dynamic_configuration_loaded events with stash segments
+        SELECT
+            distinct_id,
+            date,
+            time,
+            CASE
+                WHEN firebase_segments LIKE '%LiveOpsData.stash_test%' THEN 'test'
+                WHEN firebase_segments LIKE '%LiveOpsData.stash_control%' THEN 'control'
+            END as segment,
+            ROW_NUMBER() OVER (PARTITION BY distinct_id ORDER BY date DESC, time DESC) as rn
+        FROM `yotam-395120.peerplay.vmp_master_event_normalized`
+        WHERE mp_event_name = 'dynamic_configuration_loaded'
+          AND date >= DATE_SUB(CURRENT_DATE(), INTERVAL 30 DAY)
+          AND (firebase_segments LIKE '%LiveOpsData.stash_test%'
+               OR firebase_segments LIKE '%LiveOpsData.stash_control%')
+    ),
+    user_segments AS (
+        SELECT distinct_id, segment
+        FROM firebase_segment_events
+        WHERE rn = 1
+    ),
+    d2c_eligible_users AS (
         SELECT
             p.distinct_id,
-            CASE
-                WHEN MOD(ABS(FARM_FINGERPRINT(p.distinct_id)), 100) < 20 THEN 'test'
-                ELSE 'control'
-            END as segment
+            us.segment
         FROM `yotam-395120.peerplay.dim_player` p
-        JOIN (
-            SELECT distinct_id, MAX(version_float) as latest_version
-            FROM `yotam-395120.peerplay.vmp_master_event_normalized`
-            WHERE date >= DATE_SUB(CURRENT_DATE(), INTERVAL 30 DAY)
-              AND version_float IS NOT NULL AND version_float > 0
-            GROUP BY distinct_id
-        ) v ON p.distinct_id = v.distinct_id
+        INNER JOIN user_segments us ON p.distinct_id = us.distinct_id
         WHERE p.first_country = 'US'
-          AND v.latest_version > 0.378
-          AND DATE_DIFF(CURRENT_DATE(), DATE(p.first_event_time), DAY) > 3
     ),
     purchase_data AS (
         SELECT
@@ -282,6 +331,7 @@ def get_d2c_purchase_summary(filters: dict) -> pd.DataFrame:
 def build_d2c_segment_cte(segment: Optional[str] = None) -> tuple[str, str]:
     """
     Build CTE and JOIN clause for D2C segment filtering in other queries.
+    Uses Firebase Remote Config segments (stash_test / stash_control).
 
     Args:
         segment: 'test', 'control', 'all' (both segments), or None (no filter)
@@ -294,32 +344,41 @@ def build_d2c_segment_cte(segment: Optional[str] = None) -> tuple[str, str]:
 
     # Segment condition
     if segment == 'test':
-        segment_condition = "MOD(ABS(FARM_FINGERPRINT(p.distinct_id)), 100) < 20"
+        segment_condition = "AND segment = 'test'"
     elif segment == 'control':
-        segment_condition = "MOD(ABS(FARM_FINGERPRINT(p.distinct_id)), 100) >= 20"
+        segment_condition = "AND segment = 'control'"
     else:  # 'all' - both segments but still D2C eligible
-        segment_condition = "1=1"
+        segment_condition = ""
 
     cte = f"""
+    firebase_segment_events AS (
+        SELECT
+            distinct_id,
+            date,
+            time,
+            CASE
+                WHEN firebase_segments LIKE '%LiveOpsData.stash_test%' THEN 'test'
+                WHEN firebase_segments LIKE '%LiveOpsData.stash_control%' THEN 'control'
+            END as segment,
+            ROW_NUMBER() OVER (PARTITION BY distinct_id ORDER BY date DESC, time DESC) as rn
+        FROM `yotam-395120.peerplay.vmp_master_event_normalized`
+        WHERE mp_event_name = 'dynamic_configuration_loaded'
+          AND date >= DATE_SUB(CURRENT_DATE(), INTERVAL 30 DAY)
+          AND (firebase_segments LIKE '%LiveOpsData.stash_test%'
+               OR firebase_segments LIKE '%LiveOpsData.stash_control%')
+    ),
     d2c_segment_users AS (
         SELECT
             p.distinct_id,
-            CASE
-                WHEN MOD(ABS(FARM_FINGERPRINT(p.distinct_id)), 100) < 20 THEN 'test'
-                ELSE 'control'
-            END as d2c_segment
+            fs.segment as d2c_segment
         FROM `yotam-395120.peerplay.dim_player` p
-        JOIN (
-            SELECT distinct_id, MAX(version_float) as latest_version
-            FROM `yotam-395120.peerplay.vmp_master_event_normalized`
-            WHERE date >= DATE_SUB(CURRENT_DATE(), INTERVAL 30 DAY)
-              AND version_float IS NOT NULL AND version_float > 0
-            GROUP BY distinct_id
-        ) v ON p.distinct_id = v.distinct_id
+        INNER JOIN (
+            SELECT distinct_id, segment
+            FROM firebase_segment_events
+            WHERE rn = 1
+        ) fs ON p.distinct_id = fs.distinct_id
         WHERE p.first_country = 'US'
-          AND v.latest_version > 0.378
-          AND DATE_DIFF(CURRENT_DATE(), DATE(p.first_event_time), DAY) > 3
-          AND {segment_condition}
+          {segment_condition}
     ),
     """
 

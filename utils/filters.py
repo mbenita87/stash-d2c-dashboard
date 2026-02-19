@@ -55,7 +55,8 @@ def get_available_countries() -> List[str]:
 def init_filter_defaults():
     """Initialize default filter values in session state."""
     default_end_date = datetime.now().date()
-    default_start_date = default_end_date - timedelta(days=3)
+    # Default start date is the 15th of the current month (test start date)
+    default_start_date = datetime(2026, 2, 15).date()
 
     if 'filter_start_date' not in st.session_state:
         st.session_state.filter_start_date = default_start_date
@@ -74,7 +75,8 @@ def init_filter_defaults():
     if 'filter_is_stash_test_users' not in st.session_state:
         st.session_state.filter_is_stash_test_users = True
     if 'filter_test_start_date' not in st.session_state:
-        st.session_state.filter_test_start_date = default_end_date
+        # D2C Test started on 2026-02-15
+        st.session_state.filter_test_start_date = datetime(2026, 2, 15).date()
 
 
 def render_filters(tab: str = "stash_analytics") -> Dict[str, Any]:
@@ -200,9 +202,9 @@ def render_filters(tab: str = "stash_analytics") -> Dict[str, Any]:
         if is_business_tab:
             st.subheader("D2C Test")
             test_start_date = st.date_input(
-                "Test Start Date",
+                "Test Start Date (UTC)",
                 value=st.session_state.filter_test_start_date,
-                help="Select the date when the D2C test started"
+                help="Select the date when the D2C test started (all times are in UTC)"
             )
         else:
             test_start_date = None

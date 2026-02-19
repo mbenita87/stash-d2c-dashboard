@@ -4,6 +4,7 @@ from google.cloud import bigquery
 from google.oauth2 import service_account
 from typing import Optional, Dict, Any, List
 import streamlit as st
+import os
 
 
 def get_bigquery_client() -> bigquery.Client:
@@ -14,6 +15,10 @@ def get_bigquery_client() -> bigquery.Client:
     """
     project_id = "yotam-395120"
 
+    # On Cloud Run, use Application Default Credentials (ADC)
+    if os.environ.get('CLOUD_RUN') == 'true':
+        return bigquery.Client(project=project_id)
+
     # Check if running on Streamlit Cloud with secrets
     try:
         if hasattr(st, 'secrets') and 'gcp_service_account' in st.secrets:
@@ -22,10 +27,9 @@ def get_bigquery_client() -> bigquery.Client:
             )
             return bigquery.Client(project=project_id, credentials=credentials)
     except Exception:
-        # Secrets not configured, fall through to ADC
         pass
 
-    # Fallback to Application Default Credentials (Cloud Run / local development)
+    # Fallback to Application Default Credentials (local development)
     return bigquery.Client(project=project_id)
 
 
@@ -143,10 +147,10 @@ def build_filter_conditions(
 def build_test_users_join(include_test_users: bool) -> tuple[str, str]:
     """
     Build SQL for test users filter.
-    
+
     Args:
         include_test_users: Whether to include only test users
-    
+
     Returns:
         Tuple of (JOIN clause, WHERE clause)
     """
@@ -159,5 +163,65 @@ def build_test_users_join(include_test_users: bool) -> tuple[str, str]:
     else:
         join_clause = ""
         where_clause = ""
-    
+
     return join_clause, where_clause
+
+
+# Firebase segment CTE - reusable across queries
+FIREBASE_SEGMENT_CTE = """
+    firebase_segment_events AS (
+        SELECT
+            distinct_id,
+            CASE
+                WHEN firebase_segments LIKE '%LiveOpsData.stash_test%' THEN 'test'
+                WHEN firebase_segments LIKE '%LiveOpsData.stash_control%' THEN 'control'
+            END as segment,
+            ROW_NUMBER() OVER (PARTITION BY distinct_id ORDER BY date DESC, time DESC) as rn
+        FROM `yotam-395120.peerplay.vmp_master_event_normalized`
+        WHERE mp_event_name = 'dynamic_configuration_loaded'
+          AND date >= DATE_SUB(CURRENT_DATE(), INTERVAL 30 DAY)
+          AND (firebase_segments LIKE '%LiveOpsData.stash_test%'
+               OR firebase_segments LIKE '%LiveOpsData.stash_control%')
+    ),
+    firebase_test_users AS (
+        SELECT distinct_id
+        FROM firebase_segment_events
+        WHERE rn = 1 AND segment = 'test'
+    ),
+    firebase_control_users AS (
+        SELECT distinct_id
+        FROM firebase_segment_events
+        WHERE rn = 1 AND segment = 'control'
+    ),
+"""
+
+
+def get_firebase_segment_cte() -> str:
+    """Returns the Firebase segment CTE for use in queries."""
+    return FIREBASE_SEGMENT_CTE
+
+
+def build_firebase_test_users_join(table_alias: str = "ce") -> str:
+    """
+    Build JOIN clause for Firebase test users.
+
+    Args:
+        table_alias: Table alias to join on (default: 'ce')
+
+    Returns:
+        INNER JOIN clause string
+    """
+    return f"INNER JOIN firebase_test_users ftu ON {table_alias}.distinct_id = ftu.distinct_id"
+
+
+def build_firebase_control_users_join(table_alias: str = "ce") -> str:
+    """
+    Build JOIN clause for Firebase control users.
+
+    Args:
+        table_alias: Table alias to join on (default: 'ce')
+
+    Returns:
+        INNER JOIN clause string
+    """
+    return f"INNER JOIN firebase_control_users fcu ON {table_alias}.distinct_id = fcu.distinct_id"

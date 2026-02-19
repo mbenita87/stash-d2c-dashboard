@@ -3,7 +3,7 @@
 from typing import Dict, Any
 import pandas as pd
 import plotly.graph_objects as go
-from utils.bigquery_client import run_query, build_date_filter, build_date_filter_seconds, build_filter_conditions, build_test_users_join
+from utils.bigquery_client import run_query, build_date_filter, build_date_filter_seconds, build_filter_conditions, get_firebase_segment_cte, build_firebase_test_users_join
 
 
 def build_query(filters: Dict[str, Any]) -> str:
@@ -15,9 +15,13 @@ def build_query(filters: Dict[str, Any]) -> str:
     date_filter_client = build_date_filter(filters["start_date"], filters["end_date"], "res_timestamp")
     date_filter_server = build_date_filter_seconds(filters["start_date"], filters["end_date"], "request_timestamp")
     date_partition_filter = f"ce.date >= '{filters['start_date']}' AND ce.date <= '{filters['end_date']}'"
-    
+
     filter_conditions = build_filter_conditions(filters, "ce")
-    test_users_join, _ = build_test_users_join(filters.get("is_stash_test_users", False))
+
+    # Use Firebase segments for test users filtering
+    firebase_cte = get_firebase_segment_cte()
+    firebase_join = build_firebase_test_users_join("ce")
+    firebase_join_server = build_firebase_test_users_join("se")
     
     # Hard-coded version filter: only events with version >= 0.3775
     filter_conditions.append("ce.version_float >= 0.3775")
@@ -48,14 +52,6 @@ def build_query(filters: Dict[str, Any]) -> str:
     
     server_where_clause = " AND ".join(server_filter_conditions) if server_filter_conditions else "1=1"
     
-    # Build server events with test users filter if enabled
-    server_test_users_clause = ""
-    if filters.get("is_stash_test_users", False):
-        server_test_users_clause = """
-        INNER JOIN `yotam-395120.peerplay.stash_test_users_no_google_sheet` test_users
-        ON se.distinct_id = test_users.distinct_id
-        """
-    
     # Build first purchase exclusion logic if enabled (Chart 7 only)
     first_purchase_exclusion = ""
     first_purchase_filter_client = ""
@@ -84,7 +80,7 @@ def build_query(filters: Dict[str, Any]) -> str:
         first_purchase_filter_server = " AND purchase_funnel_id NOT IN (SELECT first_purchase_funnel_id FROM first_purchase_funnels WHERE first_purchase_funnel_id IS NOT NULL)"
     
     query = f"""
-    WITH 
+    WITH {firebase_cte}
     -- Identify funnels where user added/edited credit card
     card_edit_events AS (
       SELECT DISTINCT
@@ -122,7 +118,7 @@ def build_query(filters: Dict[str, Any]) -> str:
         ce.google_order_number,
         ce.purchase_id
       FROM `yotam-395120.peerplay.vmp_master_event_normalized` ce
-      {test_users_join.replace('client_events', 'ce') if test_users_join else ''}
+      {firebase_join}
       WHERE {where_clause}
         AND ce.purchase_funnel_id IS NOT NULL
         -- Exclude funnels with card edits
@@ -160,7 +156,7 @@ def build_query(filters: Dict[str, Any]) -> str:
           ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING
         ) as client_country_code
       FROM `yotam-395120.peerplay.verification_service_events` se
-      {server_test_users_clause}
+      {firebase_join_server}
       LEFT JOIN client_events_metadata cm
         ON se.distinct_id = cm.distinct_id
         AND cm.res_timestamp_seconds <= se.request_timestamp

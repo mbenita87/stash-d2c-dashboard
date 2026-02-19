@@ -10,12 +10,18 @@ from utils.bigquery_client import run_query
 def build_query(filters: Dict[str, Any], test_start_date: str, show_only_test: bool = False) -> str:
     """
     Build SQL query for daily KPI metrics comparing Test vs Control.
+    Uses Firebase Remote Config segments (stash_test / stash_control).
 
     Args:
         filters: Standard dashboard filters
         test_start_date: The date when the test started (YYYY-MM-DD)
         show_only_test: If True, only return Test segment data
     """
+    # Validate test_start_date - use default if None or invalid
+    if test_start_date is None or test_start_date == 'None' or not test_start_date:
+        # Default to start_date from filters or 14 days ago
+        test_start_date = filters.get('start_date', '2025-01-01')
+
     # Build filter conditions from sidebar filters
     filter_conditions = []
 
@@ -37,46 +43,75 @@ def build_query(filters: Dict[str, Any], test_start_date: str, show_only_test: b
 
     # Segment filter - only Test if show_only_test is True
     if show_only_test:
-        segment_filter = "MOD(ABS(FARM_FINGERPRINT(p.distinct_id)), 100) < 20"
+        segment_filter = "AND segment = 'Test'"
     else:
-        segment_filter = "1=1"  # No segment filter, get both
+        segment_filter = ""  # No segment filter, get both
 
     # Calculate the symmetric date range based on days since test start
     query = f"""
-    WITH d2c_eligible_users AS (
+    WITH firebase_segment_events AS (
+        -- Get all dynamic_configuration_loaded events with stash segments
+        SELECT
+            distinct_id,
+            date,
+            time,
+            CASE
+                WHEN firebase_segments LIKE '%LiveOpsData.stash_test%' THEN 'Test'
+                WHEN firebase_segments LIKE '%LiveOpsData.stash_control%' THEN 'Control'
+            END as segment,
+            ROW_NUMBER() OVER (PARTITION BY distinct_id ORDER BY date DESC, time DESC) as rn
+        FROM `yotam-395120.peerplay.vmp_master_event_normalized`
+        WHERE mp_event_name = 'dynamic_configuration_loaded'
+          AND date >= DATE_SUB(CURRENT_DATE(), INTERVAL 30 DAY)
+          AND (firebase_segments LIKE '%LiveOpsData.stash_test%'
+               OR firebase_segments LIKE '%LiveOpsData.stash_control%')
+    ),
+    user_segments AS (
+        -- Get latest segment for each user
+        SELECT distinct_id, segment
+        FROM firebase_segment_events
+        WHERE rn = 1
+    ),
+    d2c_eligible_users AS (
         SELECT
             p.distinct_id,
-            CASE
-                WHEN MOD(ABS(FARM_FINGERPRINT(p.distinct_id)), 100) < 20 THEN 'Test'
-                ELSE 'Control'
-            END as segment
+            us.segment
         FROM `yotam-395120.peerplay.dim_player` p
-        JOIN (
-            SELECT distinct_id, MAX(version_float) as latest_version
-            FROM `yotam-395120.peerplay.vmp_master_event_normalized`
-            WHERE date >= DATE_SUB(CURRENT_DATE(), INTERVAL 60 DAY)
-              AND version_float IS NOT NULL AND version_float > 0
-            GROUP BY distinct_id
-        ) v ON p.distinct_id = v.distinct_id
+        INNER JOIN user_segments us ON p.distinct_id = us.distinct_id
         WHERE p.first_country = 'US'
-          AND v.latest_version > 0.378
-          AND DATE_DIFF(CURRENT_DATE(), DATE(p.first_event_time), DAY) > 3
-          AND {segment_filter}
+          {segment_filter}
     ),
-    -- Calculate days since test start
+    -- Calculate days since test start (including test start day)
     test_info AS (
         SELECT
             DATE('{test_start_date}') as test_start_date,
-            DATE_DIFF(CURRENT_DATE(), DATE('{test_start_date}'), DAY) as days_since_start
+            -- Add 1 to include the test start day in the count
+            DATE_DIFF(CURRENT_DATE(), DATE('{test_start_date}'), DAY) + 1 as days_in_after_period
     ),
     -- Define the date range (symmetric: same days before and after test start)
     date_range AS (
         SELECT
             test_start_date,
-            days_since_start,
-            DATE_SUB(test_start_date, INTERVAL days_since_start DAY) as range_start,
+            days_in_after_period,
+            -- Go back the same number of days before test start
+            DATE_SUB(test_start_date, INTERVAL days_in_after_period DAY) as range_start,
             CURRENT_DATE() as range_end
         FROM test_info
+    ),
+    -- Get first purchase date for each user (for FTD calculation)
+    user_first_purchase AS (
+        SELECT
+            ce.distinct_id,
+            MIN(DATE(TIMESTAMP_MILLIS(CAST(ce.res_timestamp AS INT64)))) as first_purchase_date
+        FROM `yotam-395120.peerplay.vmp_master_event_normalized` ce
+        WHERE ce.mp_event_name = 'purchase_successful'
+          AND ce.date >= '2020-01-01'  -- Required for partition elimination
+          AND (
+            (ce.payment_platform = 'stash')
+            OR (ce.payment_platform = 'apple' AND ce.purchase_id IS NOT NULL AND ce.purchase_id != '')
+            OR (ce.payment_platform = 'googleplay' AND ce.google_order_number IS NOT NULL AND ce.google_order_number != '')
+          )
+        GROUP BY ce.distinct_id
     ),
     -- Get daily metrics per segment
     daily_metrics AS (
@@ -152,10 +187,23 @@ def build_query(filters: Dict[str, Any], test_start_date: str, show_only_test: b
                 WHEN ce.mp_event_name = 'click_pre_purchase'
                   AND ce.cta_name = 'continue'
                 THEN ce.purchase_funnel_id
-            END) as pp_continue_clicks
+            END) as pp_continue_clicks,
+
+            -- FTD users (First Time Depositors - users making their first ever purchase on this day)
+            COUNT(DISTINCT CASE
+                WHEN ce.mp_event_name = 'purchase_successful'
+                  AND (
+                    (ce.payment_platform = 'stash')
+                    OR (ce.payment_platform = 'apple' AND ce.purchase_id IS NOT NULL AND ce.purchase_id != '')
+                    OR (ce.payment_platform = 'googleplay' AND ce.google_order_number IS NOT NULL AND ce.google_order_number != '')
+                  )
+                  AND ufp.first_purchase_date = DATE(TIMESTAMP_MILLIS(CAST(ce.res_timestamp AS INT64)))
+                THEN ce.distinct_id
+            END) as ftd_users
 
         FROM `yotam-395120.peerplay.vmp_master_event_normalized` ce
         INNER JOIN d2c_eligible_users d2c ON ce.distinct_id = d2c.distinct_id
+        LEFT JOIN user_first_purchase ufp ON ce.distinct_id = ufp.distinct_id
         CROSS JOIN date_range dr
         WHERE ce.date >= dr.range_start
           AND ce.date <= dr.range_end
@@ -177,6 +225,7 @@ def build_query(filters: Dict[str, Any], test_start_date: str, show_only_test: b
         dm.interrupted_purchases,
         dm.purchase_clicks,
         dm.pp_continue_clicks,
+        dm.ftd_users,
 
         -- Calculated KPIs
         CASE WHEN dm.active_users > 0
@@ -184,20 +233,41 @@ def build_query(filters: Dict[str, Any], test_start_date: str, show_only_test: b
             ELSE 0
         END as ppu_percent,
 
+        -- FTD% (First Time Depositors as % of Active Users)
+        CASE WHEN dm.active_users > 0
+            THEN dm.ftd_users * 100.0 / dm.active_users
+            ELSE 0
+        END as ftd_percent,
+
         CASE WHEN dm.active_users > 0
             THEN dm.gross_revenue / dm.active_users
             ELSE 0
         END as arpdau,
+
+        CASE WHEN dm.active_users > 0
+            THEN dm.net_revenue / dm.active_users
+            ELSE 0
+        END as arpdau_net,
 
         CASE WHEN dm.paying_users > 0
             THEN dm.gross_revenue / dm.paying_users
             ELSE 0
         END as arppu,
 
+        CASE WHEN dm.paying_users > 0
+            THEN dm.net_revenue / dm.paying_users
+            ELSE 0
+        END as arppu_net,
+
         CASE WHEN dm.total_purchases > 0
             THEN dm.gross_revenue / dm.total_purchases
             ELSE 0
         END as atv,
+
+        CASE WHEN dm.total_purchases > 0
+            THEN dm.net_revenue / dm.total_purchases
+            ELSE 0
+        END as atv_net,
 
         CASE WHEN dm.purchase_clicks > 0
             THEN dm.pp_continue_clicks * 100.0 / dm.purchase_clicks
@@ -303,7 +373,9 @@ def create_did_summary_table(df: pd.DataFrame) -> pd.DataFrame:
         'gross_revenue': 'Gross Revenue ($)',
         'net_revenue': 'Net Revenue ($)',
         'paying_users': 'Paying Users',
+        'ftd_users': 'FTD Users',
         'ppu_percent': 'PPU %',
+        'ftd_percent': 'FTD %',
         'arpdau': 'ARPDAU ($)',
         'arppu': 'ARPPU ($)',
         'atv': 'ATV ($)'
@@ -407,7 +479,7 @@ def create_timeline_visualization(df: pd.DataFrame, selected_kpi: str, kpi_label
             go.Scatter(
                 x=test_df['event_date'],
                 y=test_df[test_plot_column],
-                name='Test (20%)',
+                name='Test',
                 mode='lines+markers',
                 line=dict(color='#2ecc71', width=2),
                 marker=dict(size=6),
@@ -421,7 +493,7 @@ def create_timeline_visualization(df: pd.DataFrame, selected_kpi: str, kpi_label
             go.Scatter(
                 x=control_df['event_date'],
                 y=control_df[control_plot_column],
-                name='Control (80%)',
+                name='Control',
                 mode='lines+markers',
                 line=dict(color='#3498db', width=2),
                 marker=dict(size=6),
@@ -539,6 +611,7 @@ GRAPH1_KPIS = {
     'gross_revenue': 'Gross Revenue ($)',
     'net_revenue': 'Net Revenue ($)',
     'paying_users': 'Paying Users',
+    'ftd_users': 'FTD Users',
     'arpdau': 'ARPDAU ($)',
     'arppu': 'ARPPU ($)',
     'interrupted_rate': 'Interrupted Rate (%)'
@@ -546,8 +619,72 @@ GRAPH1_KPIS = {
 
 GRAPH2_KPIS = {
     'ppu_percent': 'PPU %',
+    'ftd_percent': 'FTD %',
     'atv': 'ATV ($)',
     'purchase_to_continue_rate': 'Purchase Click to Continue Rate (%)',
     'continue_to_purchase_rate': 'Continue to Purchase Rate (%)',
     'interrupted_purchases': 'Interrupted Purchases'
 }
+
+# Net Revenue based KPIs for Net tab
+GRAPH1_KPIS_NET = {
+    'active_users': 'Active Users',
+    'total_purchases': 'Total Purchases',
+    'net_revenue': 'Net Revenue ($)',
+    'paying_users': 'Paying Users',
+    'ftd_users': 'FTD Users',
+    'arpdau_net': 'ARPDAU Net ($)',
+    'arppu_net': 'ARPPU Net ($)',
+    'interrupted_rate': 'Interrupted Rate (%)'
+}
+
+GRAPH2_KPIS_NET = {
+    'ppu_percent': 'PPU %',
+    'ftd_percent': 'FTD %',
+    'atv_net': 'ATV Net ($)',
+    'purchase_to_continue_rate': 'Purchase Click to Continue Rate (%)',
+    'continue_to_purchase_rate': 'Continue to Purchase Rate (%)',
+    'interrupted_purchases': 'Interrupted Purchases'
+}
+
+
+def create_did_summary_table_net(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Create a summary table with Diff-in-Diff for all key KPIs - Net Revenue version.
+
+    Args:
+        df: DataFrame with timeline data
+
+    Returns:
+        DataFrame with DiD summary for all KPIs using net revenue
+    """
+    kpis = {
+        'active_users': 'Active Users',
+        'total_purchases': 'Total Purchases',
+        'net_revenue': 'Net Revenue ($)',
+        'paying_users': 'Paying Users',
+        'ftd_users': 'FTD Users',
+        'ppu_percent': 'PPU %',
+        'ftd_percent': 'FTD %',
+        'arpdau_net': 'ARPDAU Net ($)',
+        'arppu_net': 'ARPPU Net ($)',
+        'atv_net': 'ATV Net ($)'
+    }
+
+    rows = []
+    for kpi, label in kpis.items():
+        did_result = calculate_diff_in_diff(df, kpi)
+        if did_result:
+            rows.append({
+                'KPI': label,
+                'Test Before': did_result['test_before'],
+                'Test After': did_result['test_after'],
+                'Test Change %': did_result['test_pct_change'],
+                'Control Before': did_result['control_before'],
+                'Control After': did_result['control_after'],
+                'Control Change %': did_result['control_pct_change'],
+                'Diff-in-Diff': did_result['diff_in_diff'],
+                'DiD %': did_result['diff_in_diff_pct']
+            })
+
+    return pd.DataFrame(rows)

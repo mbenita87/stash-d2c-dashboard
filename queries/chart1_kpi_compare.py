@@ -3,31 +3,36 @@
 from typing import Dict, Any
 import pandas as pd
 import plotly.graph_objects as go
-from utils.bigquery_client import run_query, build_date_filter, build_filter_conditions, build_test_users_join
+from utils.bigquery_client import run_query, build_date_filter, build_filter_conditions, build_test_users_join, get_firebase_segment_cte, build_firebase_test_users_join
 
 
 def build_query(filters: Dict[str, Any]) -> str:
     """
     Build SQL query for KPI comparison by payment platform.
+    Uses Firebase segments (stash_test) for user filtering.
     """
     # Build filter conditions
     date_filter = build_date_filter(filters["start_date"], filters["end_date"], "res_timestamp")
     date_partition_filter = f"ce.date >= '{filters['start_date']}' AND ce.date <= '{filters['end_date']}'"
     filter_conditions = build_filter_conditions(filters, "ce")
-    test_users_join, _ = build_test_users_join(filters.get("is_stash_test_users", False))
-    
+
     # Hard-coded version filter: only events with version >= 0.3775
     filter_conditions.append("ce.version_float >= 0.3775")
-    
+
     where_clauses = [date_partition_filter, date_filter] + filter_conditions
     where_clause = " AND ".join([c.strip() for c in where_clauses if c.strip()])
-    
+
     # Chart 1 always shows all 3 payment platforms
     platform_filter = "'stash', 'apple', 'googleplay'"
-    
+
+    # Use Firebase segments for test users filtering
+    firebase_cte = get_firebase_segment_cte()
+    firebase_join = build_firebase_test_users_join("ce")
+
     query = f"""
-    WITH client_events AS (
-      SELECT 
+    WITH {firebase_cte}
+    client_events AS (
+      SELECT
         ce.distinct_id,
         ce.mp_event_name,
         ce.purchase_funnel_id,
@@ -39,7 +44,7 @@ def build_query(filters: Dict[str, Any]) -> str:
         ce.google_order_number,
         ce.purchase_id
       FROM `yotam-395120.peerplay.vmp_master_event_normalized` ce
-      {test_users_join.replace('client_events', 'ce') if test_users_join else ''}
+      {firebase_join}
       WHERE {where_clause}
     ),
     -- Identify funnels where user clicked continue for each platform
