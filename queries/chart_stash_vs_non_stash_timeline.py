@@ -101,20 +101,6 @@ def build_query(filters: Dict[str, Any], test_start_date: str) -> str:
         WHERE distinct_id IN (SELECT distinct_id FROM stash_purchasers)
            OR distinct_id IN (SELECT distinct_id FROM iap_purchasers)
     ),
-    -- Calculate the symmetric date range based on days since test start
-    test_info AS (
-        SELECT
-            DATE('{test_start_date}') as test_start_date,
-            DATE_DIFF(CURRENT_DATE(), DATE('{test_start_date}'), DAY) + 1 as days_in_after_period
-    ),
-    date_range AS (
-        SELECT
-            test_start_date,
-            days_in_after_period,
-            DATE_SUB(test_start_date, INTERVAL days_in_after_period DAY) as range_start,
-            CURRENT_DATE() as range_end
-        FROM test_info
-    ),
     -- Get first purchase date for each user (for FTD calculation)
     user_first_purchase AS (
         SELECT
@@ -221,17 +207,16 @@ def build_query(filters: Dict[str, Any], test_start_date: str) -> str:
         FROM `yotam-395120.peerplay.vmp_master_event_normalized` ce
         INNER JOIN user_purchase_segments ups ON ce.distinct_id = ups.distinct_id
         LEFT JOIN user_first_purchase ufp ON ce.distinct_id = ufp.distinct_id
-        CROSS JOIN date_range dr
-        WHERE ce.date >= dr.range_start
-          AND ce.date <= dr.range_end
+        WHERE ce.date >= DATE('{test_start_date}')
+          AND ce.date <= CURRENT_DATE()
           AND {additional_filters}
         GROUP BY event_date, ups.segment
     )
     SELECT
         dm.event_date,
         dm.segment,
-        dr.test_start_date,
-        CASE WHEN dm.event_date >= dr.test_start_date THEN 'After' ELSE 'Before' END as period,
+        DATE('{test_start_date}') as test_start_date,
+        'After' as period,
 
         -- Raw metrics
         dm.active_users,
@@ -301,7 +286,6 @@ def build_query(filters: Dict[str, Any], test_start_date: str) -> str:
         END as interrupted_rate
 
     FROM daily_metrics dm
-    CROSS JOIN date_range dr
     ORDER BY dm.event_date, dm.segment
     """
 
@@ -328,9 +312,9 @@ def calculate_comparison(df: pd.DataFrame, kpi: str) -> Dict[str, Any]:
     if df.empty:
         return {}
 
-    # Calculate means for each segment (After period only - since test started)
-    stash_mean = df[(df['segment'] == 'Stash Purchasers') & (df['period'] == 'After')][kpi].mean()
-    non_stash_mean = df[(df['segment'] == 'Non-Stash Purchasers') & (df['period'] == 'After')][kpi].mean()
+    # Calculate means for each segment (all data is post-test start)
+    stash_mean = df[df['segment'] == 'Stash Purchasers'][kpi].mean()
+    non_stash_mean = df[df['segment'] == 'Non-Stash Purchasers'][kpi].mean()
 
     # Handle NaN
     stash_mean = stash_mean if pd.notna(stash_mean) else 0
@@ -415,15 +399,15 @@ def create_timeline_visualization(df: pd.DataFrame, selected_kpi: str, kpi_label
     if not has_stash and not has_non_stash:
         return go.Figure(), {}
 
-    # Calculate averages (After period only)
+    # Calculate averages (all data is post-test start)
     if has_stash:
-        stash_avg = df[(df['segment'] == 'Stash Purchasers') & (df['period'] == 'After')][selected_kpi].mean()
+        stash_avg = df[df['segment'] == 'Stash Purchasers'][selected_kpi].mean()
         stash_avg = stash_avg if pd.notna(stash_avg) else 0
     else:
         stash_avg = 0
 
     if has_non_stash:
-        non_stash_avg = df[(df['segment'] == 'Non-Stash Purchasers') & (df['period'] == 'After')][selected_kpi].mean()
+        non_stash_avg = df[df['segment'] == 'Non-Stash Purchasers'][selected_kpi].mean()
         non_stash_avg = non_stash_avg if pd.notna(non_stash_avg) else 0
     else:
         non_stash_avg = 0
@@ -472,16 +456,7 @@ def create_timeline_visualization(df: pd.DataFrame, selected_kpi: str, kpi_label
             row=1, col=1
         )
 
-    # Add vertical line for test start date
-    if test_start_date:
-        fig.add_vline(
-            x=pd.to_datetime(test_start_date).timestamp() * 1000,
-            line_dash="dash",
-            line_color="gray",
-            annotation_text="Test Start",
-            annotation_position="top",
-            row=1, col=1
-        )
+    # Note: All data is post-test start, no vertical line needed
 
     # Bar chart (right side) - Average comparison
     def format_val(v):

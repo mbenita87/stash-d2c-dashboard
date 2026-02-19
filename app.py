@@ -1262,8 +1262,8 @@ def render_d2c_test_funnel_tab(filters):
 
                 # Stash Purchasers vs Non-Stash Purchasers Timeline
                 st.markdown("---")
-                st.subheader("📊 Stash Purchasers vs Non-Stash Purchasers")
-                st.caption("Comparing users who made at least one Stash purchase vs users who only purchased via IAP (Test Group only)")
+                st.subheader("📊 Stash Purchasers vs Non-Stash Purchasers (Behavioral Segmentation)")
+                st.caption("⚠️ This is behavioral segmentation, NOT causal analysis. Shows who adopts Stash, not the impact of Stash. For causal analysis use Test vs Control in Business Analytics.")
 
                 with st.spinner("Loading Stash vs Non-Stash comparison data..."):
                     try:
@@ -1290,7 +1290,7 @@ def render_d2c_test_funnel_tab(filters):
                             # Summary table
                             summary_df = chart_stash_vs_non_stash_timeline.create_summary_table(stash_vs_non_stash_df)
                             if not summary_df.empty:
-                                st.markdown("##### 📈 Comparison Summary (After Test Start)")
+                                st.markdown("##### 📈 Comparison Summary (Post-Test Period Only)")
 
                                 # Format the summary table
                                 formatted_summary = summary_df.copy()
