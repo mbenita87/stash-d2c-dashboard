@@ -20,6 +20,7 @@ from queries import chart6_adoption_over_time, chart7_latency
 from queries import chart_test_vs_control_timeline
 from queries import chart_d2c_test_funnel
 from queries import promo_segment_verification
+from queries import chart_stash_vs_non_stash_timeline
 
 # Import D2C utilities
 from utils.d2c_segments import get_d2c_segment_stats, get_d2c_purchase_summary
@@ -1258,6 +1259,125 @@ def render_d2c_test_funnel_tab(filters):
                             )
                     else:
                         st.info("No Stash funnel execution data available for the selected date range.")
+
+                # Stash Purchasers vs Non-Stash Purchasers Timeline
+                st.markdown("---")
+                st.subheader("📊 Stash Purchasers vs Non-Stash Purchasers")
+                st.caption("Comparing users who made at least one Stash purchase vs users who only purchased via IAP (Test Group only)")
+
+                with st.spinner("Loading Stash vs Non-Stash comparison data..."):
+                    try:
+                        test_start_date = filters.get('test_start_date', '2025-01-26')
+                        stash_vs_non_stash_df = chart_stash_vs_non_stash_timeline.get_data(filters, test_start_date)
+
+                        if not stash_vs_non_stash_df.empty:
+                            # KPI Definitions popover
+                            with st.popover("❓ KPI Definitions"):
+                                st.markdown("""
+                                **Stash Purchasers** - Users who made at least one purchase via Stash (D2C)
+
+                                **Non-Stash Purchasers** - Users who made purchases only via IAP (Apple/Google), never via Stash
+
+                                **Active Users** - Unique users active on each day
+
+                                **ARPDAU** - Average Revenue Per Daily Active User
+
+                                **ARPPU** - Average Revenue Per Paying User
+
+                                **ATV** - Average Transaction Value
+                                """)
+
+                            # Summary table
+                            summary_df = chart_stash_vs_non_stash_timeline.create_summary_table(stash_vs_non_stash_df)
+                            if not summary_df.empty:
+                                st.markdown("##### 📈 Comparison Summary (After Test Start)")
+
+                                # Format the summary table
+                                formatted_summary = summary_df.copy()
+                                for col in ['Stash Purchasers', 'Non-Stash Purchasers', 'Difference']:
+                                    formatted_summary[col] = formatted_summary[col].apply(
+                                        lambda x: f"${x:,.2f}" if 'Revenue' in str(formatted_summary['KPI'].iloc[0]) or '$' in str(formatted_summary['KPI'].iloc[0]) else f"{x:,.2f}"
+                                    )
+                                formatted_summary['Diff %'] = formatted_summary['Diff %'].apply(lambda x: f"{x:+.1f}%")
+
+                                st.dataframe(formatted_summary, use_container_width=True, hide_index=True)
+
+                            st.markdown("---")
+
+                            # Graph 1: Revenue & Users Metrics
+                            st.markdown("#### Revenue & Users Metrics")
+                            col1, col2 = st.columns([1, 3])
+                            with col1:
+                                kpi1_options = list(chart_stash_vs_non_stash_timeline.GRAPH1_KPIS.keys())
+                                selected_kpi1 = st.selectbox(
+                                    "Select KPI",
+                                    options=kpi1_options,
+                                    format_func=lambda x: chart_stash_vs_non_stash_timeline.GRAPH1_KPIS[x],
+                                    key="stash_vs_non_stash_kpi1"
+                                )
+                            with col2:
+                                fig1, summary1 = chart_stash_vs_non_stash_timeline.create_timeline_visualization(
+                                    stash_vs_non_stash_df, selected_kpi1,
+                                    chart_stash_vs_non_stash_timeline.GRAPH1_KPIS[selected_kpi1]
+                                )
+                                st.plotly_chart(fig1, use_container_width=True)
+
+                                # Show summary metrics
+                                if summary1.get('has_stash') or summary1.get('has_non_stash'):
+                                    col_s1, col_s2, col_s3 = st.columns(3)
+                                    with col_s1:
+                                        st.metric("Stash Purchasers Avg", f"{summary1.get('stash_purchasers', 0):,.2f}")
+                                    with col_s2:
+                                        st.metric("Non-Stash Purchasers Avg", f"{summary1.get('non_stash_purchasers', 0):,.2f}")
+                                    with col_s3:
+                                        diff_pct = summary1.get('diff_pct', 0)
+                                        st.metric("Difference", f"{diff_pct:+.1f}%")
+
+                            st.markdown("---")
+
+                            # Graph 2: Conversion & Other Metrics
+                            st.markdown("#### Conversion & Other Metrics")
+                            col1, col2 = st.columns([1, 3])
+                            with col1:
+                                selected_kpi2 = st.selectbox(
+                                    "Select KPI",
+                                    options=list(chart_stash_vs_non_stash_timeline.GRAPH2_KPIS.keys()),
+                                    format_func=lambda x: chart_stash_vs_non_stash_timeline.GRAPH2_KPIS[x],
+                                    key="stash_vs_non_stash_kpi2"
+                                )
+                            with col2:
+                                fig2, summary2 = chart_stash_vs_non_stash_timeline.create_timeline_visualization(
+                                    stash_vs_non_stash_df, selected_kpi2,
+                                    chart_stash_vs_non_stash_timeline.GRAPH2_KPIS[selected_kpi2]
+                                )
+                                st.plotly_chart(fig2, use_container_width=True)
+
+                                # Show summary metrics
+                                if summary2.get('has_stash') or summary2.get('has_non_stash'):
+                                    col_s1, col_s2, col_s3 = st.columns(3)
+                                    with col_s1:
+                                        st.metric("Stash Purchasers Avg", f"{summary2.get('stash_purchasers', 0):,.2f}")
+                                    with col_s2:
+                                        st.metric("Non-Stash Purchasers Avg", f"{summary2.get('non_stash_purchasers', 0):,.2f}")
+                                    with col_s3:
+                                        diff_pct2 = summary2.get('diff_pct', 0)
+                                        st.metric("Difference", f"{diff_pct2:+.1f}%")
+
+                            # Download option
+                            with st.expander("📥 Download Stash vs Non-Stash Data"):
+                                st.dataframe(stash_vs_non_stash_df)
+                                csv_data = stash_vs_non_stash_df.to_csv(index=False).encode('utf-8')
+                                st.download_button(
+                                    label="Download CSV",
+                                    data=csv_data,
+                                    file_name=f"stash_vs_non_stash_{filters['start_date']}_to_{filters['end_date']}.csv",
+                                    mime="text/csv",
+                                    key="download_stash_vs_non_stash"
+                                )
+                        else:
+                            st.info("No data available for Stash vs Non-Stash comparison. Make sure there are purchasers in both segments.")
+                    except Exception as e:
+                        st.warning(f"Could not load Stash vs Non-Stash comparison: {str(e)}")
 
                 # Stash to IAP Users - Users who purchased via Stash then switched to IAP
                 st.markdown("---")
